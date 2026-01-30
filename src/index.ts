@@ -1,465 +1,416 @@
-import { Context, Schema, Session, h, isNullable } from 'koishi'
+import { Context, Schema, h, Logger, Session } from 'koishi'
+import { spawn } from 'node:child_process'
 
-// 可选依赖：puppeteer（用于生成图片歌单）。
-// 这里不直接 import 'koishi-plugin-puppeteer'，避免你本地没装 types 时 TS 报错。
 declare module 'koishi' {
   interface Context {
     puppeteer?: any
+    downloads?: any
+    silk?: {
+      encode(input: Buffer, options?: any): Promise<Buffer> | Buffer
+    }
   }
 }
 
 export const name = 'music-to-voice'
-export const usage = `
-## Music to Voice（GD 音乐台 API 适配版）
+export const using = ['http'] as const
+const logger = new Logger('music-to-voice')
 
-- 通过 GD 音乐台 API 搜索歌曲，并发送语音/音频/文件等
-- 支持选择音乐源（网易云/QQ/酷狗/酷我/咪咕…）
-- 支持选择音质 br：128/192/320/740/999（740/999 为无损，体积大更慢）
+export interface Config {
+  commandName: string
+  commandAlias: string
+  generationTip: string
 
-> 提示：图片歌单需要 puppeteer 服务（可选安装）；不装也能用文本歌单。
-`
+  promptTimeoutSec: number
+  searchListCount: number
+  nextPageCommand: string
+  prevPageCommand: string
+  exitCommandList: string[]
+  menuExitCommandTip: boolean
 
-export const Config = Schema.intersect([
-  Schema.object({
-    commandName: Schema.string().default('music').description('使用的指令名称'),
-    commandAlias: Schema.string().default('mdff').description('使用的指令别名'),
-    generationTip: Schema.string().default('生成语音中…').description('生成语音时返回的文字提示内容'),
+  menuRecallSec: number
+  tipRecallSec: number
+  recallMessages: string[]                // generationTip / songList
+  recallOnlyAfterSuccess: boolean
+  keepMenuIfSendFailed: boolean
 
-    recallMessages: Schema.array(String)
-      .role('table')
-      .default(['generationTip', 'songList'])
-      .description('勾选后将 撤回/不发送 对应的提示消息（勾选=撤回/不发送，不勾选=不撤回/发送）'),
+  apiBase: string
+  source: string                          // 用 string，Schema 用 union 做选择
+  br: number
 
-    recallDelaySec: Schema.natural().min(0).step(1)
-      .default(10)
-      .description('撤回延迟（秒）<br>0=立即撤回；建议 8~20 秒，避免提示消息撤回过快'),
-  }).description('过滤器设置'),
+  userAgent: string
+  requestTimeoutMs: number
 
-  Schema.object({
-    promptTimeout: Schema.string().default('输入超时，已取消点歌').description('超时提示（输入超时，已取消点歌）'),
-    exitPrompt: Schema.string().default('已退出歌曲选择').description('退出提示（已退出歌曲选择）'),
-    invalidNumber: Schema.string().default('序号输入错误，已退出歌曲选择').description('序号错误提示（序号输入错误，已退出歌曲选择）'),
-    durationExceeded: Schema.string().default('歌曲持续时间超出限制').description('时长超限提示（歌曲持续时间超出限制）'),
-    getSongFailed: Schema.string().default('获取歌曲失败，请稍后再试').description('获取失败提示（获取歌曲失败，请稍后再试）'),
+  sendMode: string                        // record / buffer
+  forceTranscode: boolean
+  maxSongDurationMin: number
+  ffmpegBin: string
 
-    waitForChoiceSec: Schema.natural().min(5).step(1).default(45).description('等待用户选择歌曲序号的最长时间（秒）'),
-    pageSize: Schema.natural().min(5).step(1).default(20).description('搜索的歌曲列表的数量'),
+  debug: boolean
+}
 
-    nextPageCmd: Schema.string().default('下一页').description('翻页指令-下一页'),
-    prevPageCmd: Schema.string().default('上一页').description('翻页指令-上一页'),
-    exitCmds: Schema.array(String).role('table').default(['0', '不听了']).description('退出选择指令（一行一个）'),
-
-    showExitHintInList: Schema.boolean().default(true).description('是否在歌单内容的后面，加上退出选择指令的文字提示'),
-    maxDurationMin: Schema.natural().min(1).step(1).default(30).description('歌曲最长持续时间（分钟）<br>注意：部分音乐源搜索结果不返回时长，将跳过此限制'),
-  }).description('基础设置'),
-
-  Schema.object({
-    listMode: Schema.union([
-      Schema.const('text').description('文本歌单'),
-      Schema.const('image').description('图片歌单（需要 puppeteer，可选安装）'),
-    ]).default('text').description('歌单设置'),
-
-    // 发送载体
-    srcToWhat: Schema.union([
-      Schema.const('text').description('文本 h.text'),
-      Schema.const('audio').description('语音 h.audio（直链）'),
-      Schema.const('audiobuffer').description('语音（buffer）h.audio（更稳，但更耗流量/时间）'),
-      Schema.const('file').description('文件 h.file'),
-      Schema.const('video').description('视频 h.video（不推荐）'),
-    ]).default('audio').description('歌曲信息的返回格式'),
-  }).description('歌单设置'),
-
-  Schema.object({
-    enableRateLimit: Schema.boolean().default(false).description('是否启用频率限制'),
-    rateLimitWindowSec: Schema.natural().min(1).step(1).default(60).description('频率限制窗口（秒）'),
-    rateLimitMax: Schema.natural().min(1).step(1).default(3).description('窗口内最大次数'),
-  }).description('频率限制'),
-
-  Schema.object({
-    apiBase: Schema.string().default('https://music-api.gdstudio.xyz/api.php')
-      .description('后端API地址<br>默认：GD音乐台 API（可自行替换为其它兼容接口）')
-      .role('link'),
-
-    source: Schema.union([
-      Schema.const('netease').description('网易云（推荐/默认）'),
-      Schema.const('tencent').description('QQ 音乐'),
-      Schema.const('kugou').description('酷狗音乐'),
-      Schema.const('kuwo').description('酷我音乐'),
-      Schema.const('migu').description('咪咕音乐'),
-      Schema.const('ximalaya').description('喜马拉雅'),
-      Schema.const('apple').description('Apple Music'),
-      Schema.const('spotify').description('Spotify'),
-      Schema.const('ytmusic').description('YouTube Music'),
-      Schema.const('tidal').description('Tidal'),
-      Schema.const('qobuz').description('Qobuz'),
-      Schema.const('joox').description('JOOX'),
-      Schema.const('deezer').description('Deezer'),
-    ])
-      .default('netease')
-      .description('音乐源（部分可能失效，建议使用稳定音乐源）'),
-
-    br: Schema.union([
-      Schema.const(128).description('128K（省流）'),
-      Schema.const(192).description('192K'),
-      Schema.const(320).description('320K（高品质）'),
-      Schema.const(740).description('740（无损）'),
-      Schema.const(999).description('999（无损/默认）'),
-    ])
-      .default(999)
-      .description('音质<br>740、999 为无损音质，体积更大，生成更慢，可能更容易失败'),
-
-    requestTimeoutSec: Schema.natural().min(3).step(1).default(20).description('请求超时（秒）'),
-
-    // 海外可选：Apifox Web Proxy
-    useProxy: Schema.boolean().default(false).description('是否使用 Apifox Web Proxy 代理请求（适用于海外用户）'),
-    apifoxProxyUrl: Schema.string().default('').description('Apifox Web Proxy 地址（例如：https://xxx.apifoxmock.com）'),
-  }).description('请求设置'),
-
-  Schema.object({
-    debug: Schema.boolean().default(false).description('日志调试模式'),
-  }).description('开发者选项'),
-])
-
-type SongData = {
-  id: number
+type SongItem = {
+  id: string
   name: string
-  artists: string
-  albumName: string
-  duration: number // ms，部分源可能拿不到：0
+  artist?: string[] | string
+  album?: string
+  source?: string
+  url_id?: string
 }
 
 type PendingState = {
   userId: string
   channelId: string
-  keyword: string
   page: number
-  list: SongData[]
-  songListMessageId?: string
-  tipMessageId?: string
+  keyword: string
+  songs: SongItem[]
   createdAt: number
+  menuMessageIds: string[]
 }
 
-export function apply(ctx: Context, config: any) {
-  const logger = ctx.logger(name)
-  const rateLimitMap = new Map<string, number>()
-  const pendingMap = new Map<string, PendingState>()
+const pending = new Map<string, PendingState>()
 
-  function recallLater(session: Session, messageId?: string) {
-    if (!messageId) return
-    const ch = session.channelId
-    if (!ch) return
-    const delay = Number(config.recallDelaySec || 0)
-    if (delay <= 0) {
-      session.bot.deleteMessage(ch, messageId).catch(() => {})
-      return
-    }
-    setTimeout(() => {
-      session.bot.deleteMessage(ch, messageId).catch(() => {})
-    }, delay * 1000)
-  }
+// ---------- Schema helpers (兼容版本) ----------
+const SourceSchema = Schema.union([
+  Schema.const('netease').description('网易云（推荐）'),
+  Schema.const('tencent').description('QQ'),
+  Schema.const('kugou').description('酷狗'),
+  Schema.const('kuwo').description('酷我'),
+  Schema.const('migu').description('咪咕'),
+  Schema.const('ximalaya').description('喜马拉雅'),
+  Schema.const('apple').description('Apple Music'),
+  Schema.const('spotify').description('Spotify'),
+  Schema.const('ytmusic').description('YouTube Music'),
+  Schema.const('deezer').description('Deezer'),
+  Schema.const('tidal').description('Tidal'),
+  Schema.const('qobuz').description('Qobuz'),
+  Schema.const('joox').description('JOOX'),
+]).default('netease')
 
-  function hitRateLimit(key: string) {
-    if (!config.enableRateLimit) return false
-    const now = Date.now()
-    const last = rateLimitMap.get(key) || 0
-    if (now - last > config.rateLimitWindowSec * 1000) {
-      rateLimitMap.set(key, now)
-      return false
-    }
-    return true
-  }
+const BrSchema = Schema.union([
+  Schema.const(128).description('128k（更稳）'),
+  Schema.const(192).description('192k（更稳）'),
+  Schema.const(320).description('320k（可能返回 wma）'),
+  Schema.const(740).description('740（无损，可能返回 wma）'),
+  Schema.const(999).description('999（无损，可能返回 wma）'),
+]).default(999)
 
-  async function requestWithProxy(url: string) {
-    if (!config.apifoxProxyUrl) throw new Error('Apifox proxy url is empty')
-    const proxyUrl = config.apifoxProxyUrl.replace(/\/$/, '')
-    const headers = { 'user-agent': 'koishi-music-to-voice' }
-    const timeout = (config.requestTimeoutSec || 20) * 1000
-    // 这里按常见 Apifox 代理方式拼接：proxy + 原始 URL
-    const finalUrl = `${proxyUrl}/${encodeURIComponent(url)}`
-    return await ctx.http.get(finalUrl, { timeout, headers })
-  }
+const SendModeSchema = Schema.union([
+  Schema.const('record').description('语音（直链）'),
+  Schema.const('buffer').description('语音（buffer，更稳）'),
+]).default('record')
 
-  async function searchGD(keyword: string, page: number, limit: number): Promise<SongData[]> {
-    const headers = { 'user-agent': 'koishi-music-to-voice' }
-    const timeout = (config.requestTimeoutSec || 20) * 1000
-    const url = `${config.apiBase}?types=search&source=${config.source}&name=${encodeURIComponent(keyword)}&count=${limit}&pages=${page}`
+const RecallMessagesSchema =
+  // 有的版本支持 checkbox；不支持也没关系，UI 可能退化成数组输入
+  (Schema.array(String).default(['generationTip', 'songList']) as any)
+    .role?.('checkbox') ?? Schema.array(String).default(['generationTip', 'songList'])
 
+// ---------- Config Schema ----------
+export const Config: Schema<Config> = (Schema.intersect([
+  Schema.object({}).description('开启插件前，请确保以下服务已经启用！'),
+  Schema.object({
+    _tip_required: Schema.const('required').description('所需服务：puppeteer（可选安装，用于图片歌单）'),
+    _tip_optional: Schema.const('optional').description('可选依赖：downloads / ffmpeg / silk（用于 buffer 转码发送）'),
+    _tip_transcode: Schema.const('transcode').description('开启【强制转码】后建议选择 buffer 发送：下载→ffmpeg→silk→buffer'),
+  }),
+
+  Schema.object({
+    commandName: Schema.string().default('music').description('使用的指令名称'),
+    commandAlias: Schema.string().default('听歌').description('使用的指令别名'),
+    generationTip: Schema.string().default('生成语音中…').description('生成语音时返回的文字提示内容'),
+    promptTimeoutSec: Schema.number().default(45).min(5).max(300).description('等待用户选择歌曲序号的最长时间（秒）'),
+  }).description('基础设置'),
+
+  Schema.object({
+    searchListCount: Schema.number().default(20).min(5).max(50).description('搜索的歌曲列表数量'),
+    nextPageCommand: Schema.string().default('下一页').description('翻页指令-下一页'),
+    prevPageCommand: Schema.string().default('上一页').description('翻页指令-上一页'),
+    exitCommandList: Schema.array(String).default(['0', '不听了']).description('退出选择指令（一行一个）'),
+    menuExitCommandTip: Schema.boolean().default(true).description('是否在歌单末尾显示退出提示'),
+  }).description('歌单设置'),
+
+  Schema.object({
+    menuRecallSec: Schema.number().default(60).min(0).max(600).description('歌单撤回秒数（0=不撤回）'),
+    tipRecallSec: Schema.number().default(10).min(0).max(120).description('“生成中”提示撤回秒数（0=不撤回）'),
+
+    recallMessages: (RecallMessagesSchema as any).description('勾选后撤回对应消息（generationTip/songList）'),
+
+    recallOnlyAfterSuccess: Schema.boolean().default(true).description('仅在发送成功后才撤回（推荐开启）'),
+    keepMenuIfSendFailed: Schema.boolean().default(true).description('发送失败时保留歌单（推荐开启）'),
+  }).description('撤回策略'),
+
+  Schema.object({
+    apiBase: Schema.string().default('https://music-api.gdstudio.xyz/api.php').description('后端 API 地址'),
+    source: (SourceSchema as any).description('音乐源（部分可能失效，建议使用稳定音乐源）'),
+    br: (BrSchema as any).description('音质 br（740/999 无损；高码率可能返回 wma，建议强制转码）'),
+    userAgent: Schema.string().default('koishi-music-to-voice/1.0').description('请求 UA'),
+    requestTimeoutMs: Schema.number().default(15000).min(3000).max(60000).description('请求超时（毫秒）'),
+  }).description('请求设置'),
+
+  Schema.object({
+    sendMode: (SendModeSchema as any).description('发送类型'),
+    forceTranscode: Schema.boolean().default(false).description('强制转码（开启后请选择 buffer 发送）'),
+    maxSongDurationMin: Schema.number().default(30).min(0).max(180).description('歌曲最长持续时间（分钟，0=不限制）'),
+    ffmpegBin: Schema.string().default('ffmpeg').description('ffmpeg 可执行文件（容器一般为 ffmpeg）'),
+  }).description('进阶设置'),
+
+  Schema.object({
+    debug: Schema.boolean().default(false).description('日志调试模式'),
+  }).description('开发者选项'),
+]) as any)
+
+// ---------- utils ----------
+function keyOf(session: Session) {
+  const uid = session.userId ?? 'unknown-user'
+  const cid = session.channelId ?? 'unknown-channel'
+  return `${session.platform}:${uid}:${cid}`
+}
+
+function normalizeArtists(artist: SongItem['artist']): string {
+  if (!artist) return ''
+  if (Array.isArray(artist)) return artist.join('/')
+  return String(artist)
+}
+
+function isExitInput(input: string, exits: string[]) {
+  const s = input.trim()
+  return exits.some(x => x.trim() === s)
+}
+
+async function safeSend(session: Session, content: string) {
+  const ret = await session.send(content)
+  if (Array.isArray(ret)) return ret.map(String)
+  if (ret == null) return []
+  return [String(ret)]
+}
+
+async function safeRecall(session: Session, messageIds: string[]) {
+  const bot: any = session.bot as any
+  if (!messageIds?.length) return
+  if (typeof bot?.deleteMessage !== 'function') return
+  for (const mid of messageIds) {
     try {
-      const raw = config.useProxy ? await requestWithProxy(url) : await ctx.http.get(url, { timeout, headers })
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
-      if (!Array.isArray(parsed) || parsed.length === 0) return []
-
-      return parsed.map((song: any) => {
-        const artists =
-          Array.isArray(song.artist) ? song.artist.join('/') :
-          Array.isArray(song.artists) ? song.artists.join('/') :
-          (song.artist || song.artists || '')
-        return {
-          id: Number(song.id),
-          name: String(song.name ?? ''),
-          artists: String(artists ?? ''),
-          albumName: String(song.album ?? ''),
-          duration: 0,
-        } as SongData
-      }).filter((x: SongData) => x.id && x.name)
-    } catch (e) {
-      logger.warn(`search failed: ${String(e)}`)
-      return []
-    }
+      await bot.deleteMessage(session.channelId, mid)
+    } catch {}
   }
+}
 
-  async function resolveDirectUrl(songId: number): Promise<string> {
-    const headers = { 'user-agent': 'koishi-music-to-voice' }
-    const timeout = (config.requestTimeoutSec || 20) * 1000
-    const urlApi = `${config.apiBase}?types=url&source=${config.source}&id=${songId}&br=${config.br}`
+function buildSearchUrl(cfg: Config, keyword: string, page: number) {
+  const u = new URL(cfg.apiBase)
+  u.searchParams.set('types', 'search')
+  u.searchParams.set('source', cfg.source)
+  u.searchParams.set('name', keyword)
+  u.searchParams.set('count', String(cfg.searchListCount))
+  u.searchParams.set('pages', String(page))
+  return u.toString()
+}
 
-    const raw = config.useProxy ? await requestWithProxy(urlApi) : await ctx.http.get(urlApi, { timeout, headers })
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+function buildSongUrl(cfg: Config, song: SongItem) {
+  const u = new URL(cfg.apiBase)
+  u.searchParams.set('types', 'url')
+  u.searchParams.set('id', song.url_id || song.id)
+  u.searchParams.set('source', cfg.source)
+  u.searchParams.set('br', String(cfg.br))
+  return u.toString()
+}
 
-    const direct =
-      parsed?.url ||
-      parsed?.data?.url ||
-      parsed?.data?.[0]?.url ||
-      parsed?.[0]?.url
+async function httpGetJson(ctx: Context, cfg: Config, url: string) {
+  const res = await ctx.http.get(url, {
+    timeout: cfg.requestTimeoutMs,
+    headers: { 'user-agent': cfg.userAgent },
+  })
+  if (typeof res === 'string') return JSON.parse(res)
+  return res
+}
 
-    if (!direct || typeof direct !== 'string') throw new Error('empty url')
-    return direct
-  }
+async function httpGetBuffer(ctx: Context, cfg: Config, url: string): Promise<Buffer> {
+  const ab = await ctx.http.get<ArrayBuffer>(url, {
+    timeout: cfg.requestTimeoutMs,
+    responseType: 'arraybuffer',
+    headers: { 'user-agent': cfg.userAgent },
+  })
+  return Buffer.from(ab)
+}
 
-  function formatDuration(ms: number) {
-    if (!ms || ms <= 0) return '--:--'
-    const sec = Math.floor(ms / 1000)
-    const m = Math.floor(sec / 60)
-    const s = sec % 60
-    return `${m}:${String(s).padStart(2, '0')}`
-  }
-
-  async function renderSongListText(keyword: string, page: number, list: SongData[]) {
-    const lines: string[] = []
-    lines.push(`🎵 搜索：${keyword}（第 ${page} 页）`)
-    lines.push('')
-    list.forEach((s, i) => {
-      const dur = formatDuration(s.duration)
-      lines.push(`${i + 1}. ${s.name} - ${s.artists}  [${dur}]`)
+async function ffmpegToWav(cfg: Config, input: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', 'pipe:0',
+      '-ac', '1',
+      '-ar', '48000',
+      '-f', 'wav',
+      'pipe:1',
+    ]
+    const p = spawn(cfg.ffmpegBin || 'ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    const chunks: Buffer[] = []
+    const err: Buffer[] = []
+    p.stdout.on('data', (d: Buffer) => chunks.push(d))
+    p.stderr.on('data', (d: Buffer) => err.push(d))
+    p.on('error', reject)
+    p.on('close', (code) => {
+      if (code === 0) return resolve(Buffer.concat(chunks))
+      reject(new Error(`ffmpeg failed: ${Buffer.concat(err).toString('utf8')}`))
     })
-    lines.push('')
-    lines.push(`指令：${config.prevPageCmd} / ${config.nextPageCmd}`)
-    if (config.showExitHintInList && Array.isArray(config.exitCmds) && config.exitCmds.length) {
-      lines.push(`退出：${config.exitCmds.join(' / ')}`)
-    }
-    lines.push('回复序号即可点歌。')
-    return lines.join('\n')
+    p.stdin.end(input)
+  })
+}
+
+function renderMenu(cfg: Config, keyword: string, page: number, songs: SongItem[]) {
+  const lines: string[] = []
+  lines.push(`🎵 搜索：${keyword}（第 ${page} 页）`)
+  lines.push('')
+  for (let i = 0; i < songs.length; i++) {
+    const s = songs[i]
+    const artist = normalizeArtists(s.artist)
+    const title = artist ? `${s.name} - ${artist}` : s.name
+    lines.push(`${i + 1}. ${title}`)  // ✅ 不再输出 [--:--]
+  }
+  lines.push('')
+  lines.push(`指令：${cfg.prevPageCommand} / ${cfg.nextPageCommand}`)
+  if (cfg.menuExitCommandTip && cfg.exitCommandList?.length) {
+    lines.push(`退出：${cfg.exitCommandList.join(' / ')}`)
+  }
+  lines.push('回复序号即可点歌。')
+  return lines.join('\n')
+}
+
+// ---------- apply ----------
+export function apply(ctx: Context, cfg: Config) {
+  const debug = (msg: string, ...args: any[]) => {
+    if (cfg.debug) logger.info(msg, ...args)
   }
 
-  async function renderSongListImage(keyword: string, page: number, list: SongData[]) {
-    // 没装 puppeteer 或没启用就退回文本
-    if (!ctx.puppeteer) return null
+  const cmd = ctx.command(cfg.commandName, '音乐聚合点歌并发送语音').alias(cfg.commandAlias)
+
+  cmd.action(async (argv, ...args) => {
+    const session = argv.session as Session
+    const keyword = args.join(' ').trim()
+    if (!keyword) return '请输入关键词，例如：听歌 不甘'
+
+    const k = keyOf(session)
+    const page = 1
+
+    let data: any
     try {
-      const html = `
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;padding:24px;}
-    .title{font-size:20px;font-weight:700;margin-bottom:10px;}
-    .sub{color:#666;margin-bottom:16px;}
-    .item{margin:6px 0;padding:8px 10px;border-radius:10px;border:1px solid #eee;}
-    .idx{font-weight:700;margin-right:8px;}
-    .meta{color:#666;font-size:12px;margin-top:4px;}
-  </style>
-</head>
-<body>
-  <div class="title">🎵 搜索：${keyword}</div>
-  <div class="sub">第 ${page} 页 · 回复序号点歌 · ${config.prevPageCmd}/${config.nextPageCmd}</div>
-  ${list.map((s, i) => `
-    <div class="item">
-      <span class="idx">${i + 1}.</span> ${escapeHtml(s.name)} - ${escapeHtml(s.artists)}
-      <div class="meta">专辑：${escapeHtml(s.albumName)} · 时长：${formatDuration(s.duration)}</div>
-    </div>
-  `).join('')}
-</body>
-</html>`
-      const pageObj = await ctx.puppeteer.page()
-      await pageObj.setContent(html, { waitUntil: 'networkidle0' })
-      const buf = await pageObj.screenshot({ fullPage: true })
-      await pageObj.close()
-      return buf
-    } catch (e) {
-      logger.warn(`render image list failed: ${String(e)}`)
-      return null
+      data = await httpGetJson(ctx, cfg, buildSearchUrl(cfg, keyword, page))
+    } catch (e: any) {
+      debug('search failed: %s', e?.message || e)
+      return '搜索失败（API 不可用或超时），请稍后再试。'
     }
-  }
 
-  function escapeHtml(s: string) {
-    return String(s || '').replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#39;',
-    }[c] as string))
-  }
+    const songs: SongItem[] = Array.isArray(data) ? data : (data?.data ?? [])
+    if (!songs?.length) return '未搜索到结果，请换个关键词。'
 
-  async function sendSongList(session: Session, keyword: string, page: number, list: SongData[]) {
-    if (config.listMode === 'image') {
-      const buf = await renderSongListImage(keyword, page, list)
-      if (buf) return await session.send(h.image(buf, 'image/png'))
+    const menu = renderMenu(cfg, keyword, page, songs)
+    const menuMessageIds = await safeSend(session, menu)
+
+    pending.set(k, {
+      userId: session.userId ?? 'unknown-user',
+      channelId: session.channelId ?? 'unknown-channel',
+      page,
+      keyword,
+      songs,
+      createdAt: Date.now(),
+      menuMessageIds,
+    })
+
+    // 仅在 onlyAfterSuccess=false 时，允许自动撤回歌单
+    if (cfg.menuRecallSec > 0 && cfg.recallMessages.includes('songList')) {
+      ctx.setTimeout(async () => {
+        const st = pending.get(k)
+        if (!st || st.keyword !== keyword || st.page !== page) return
+        if (cfg.recallOnlyAfterSuccess) return
+        await safeRecall(session, st.menuMessageIds)
+      }, cfg.menuRecallSec * 1000)
     }
-    const text = await renderSongListText(keyword, page, list)
-    return await session.send(text)
-  }
-
-  ctx.i18n.define('zh-CN', {
-    commands: {
-      [config.commandName]: {
-        description: '搜索歌曲并发送语音（GD 音乐台 API）',
-      },
-    },
+    return
   })
 
-  ctx.command(`${config.commandName} <keyword:text>`, '搜索歌曲并发送语音')
-    .alias(config.commandAlias)
-    .action(async ({ session, options }, keyword) => {
-      if (!session) return
-      if (!session.userId || !session.channelId) return '无法获取会话信息（userId/channelId），请检查适配器权限。'
-      if (!keyword) return
+  ctx.middleware(async (session, next) => {
+    const k = keyOf(session)
+    const st = pending.get(k)
+    if (!st) return next()
 
-      const rateKey = `${session.channelId}:${session.userId}`
-      if (hitRateLimit(rateKey)) return '操作过于频繁，请稍后再试。'
+    if (Date.now() - st.createdAt > cfg.promptTimeoutSec * 1000) {
+      pending.delete(k)
+      return next()
+    }
 
-      // 清理旧状态
-      pendingMap.delete(rateKey)
+    const input = String(session.content || '').trim()
+    if (!input) return next()
 
-      const page = 1
-      const list = await searchGD(keyword, page, Number(config.pageSize || 20))
-      if (!list.length) {
-        return '搜索失败（API 不可用或超时），请稍后再试。'
-      }
-
-      const msgId = await sendSongList(session, keyword, page, list)
-
-      const state: PendingState = {
-        userId: session.userId ?? '',
-        channelId: session.channelId ?? '',
-        keyword,
-        page,
-        list,
-        songListMessageId: Array.isArray(msgId) ? msgId[0] : (isNullable(msgId) ? undefined : String(msgId)),
-        createdAt: Date.now(),
-      }
-      pendingMap.set(rateKey, state)
-
-      // 等待用户选择
-      const input = await session.prompt(Number(config.waitForChoiceSec || 45) * 1000)
-      if (!input) {
-        if (config.recallMessages.includes('promptTimeout') === false) {
-          await session.send(config.promptTimeout)
-        }
-        if (config.recallMessages.includes('songList') && state.songListMessageId) recallLater(session, state.songListMessageId)
-        pendingMap.delete(rateKey)
-        return
-      }
-
-      // 翻页
-      if (input === config.nextPageCmd || input === config.prevPageCmd) {
-        const nextPage = input === config.nextPageCmd ? state.page + 1 : Math.max(1, state.page - 1)
-        const newList = await searchGD(state.keyword, nextPage, Number(config.pageSize || 20))
-        if (!newList.length) return '搜索失败（API 不可用或超时），请稍后再试。'
-        const newMsgId = await sendSongList(session, state.keyword, nextPage, newList)
-        // 撤回旧歌单（延迟）
-        if (config.recallMessages.includes('songList') && state.songListMessageId) recallLater(session, state.songListMessageId)
-
-        state.page = nextPage
-        state.list = newList
-        state.songListMessageId = Array.isArray(newMsgId) ? newMsgId[0] : (isNullable(newMsgId) ? undefined : String(newMsgId))
-        pendingMap.set(rateKey, state)
-        return
-      }
-
-      // 退出
-      if (Array.isArray(config.exitCmds) && config.exitCmds.includes(input)) {
-        if (config.recallMessages.includes('exitPrompt') === false) {
-          await session.send(config.exitPrompt)
-        }
-        if (config.recallMessages.includes('songList') && state.songListMessageId) recallLater(session, state.songListMessageId)
-        pendingMap.delete(rateKey)
-        return
-      }
-
-      const idx = Number(input)
-      if (!Number.isFinite(idx) || idx < 1 || idx > state.list.length) {
-        if (config.recallMessages.includes('invalidNumber') === false) {
-          await session.send(config.invalidNumber)
-        }
-        if (config.recallMessages.includes('songList') && state.songListMessageId) recallLater(session, state.songListMessageId)
-        pendingMap.delete(rateKey)
-        return
-      }
-
-      const selected = state.list[idx - 1]
-
-      // 生成提示
-      const tipId = await session.send(config.generationTip)
-      const tipMessageId = Array.isArray(tipId) ? tipId[0] : (isNullable(tipId) ? undefined : String(tipId))
-
-      // 获取直链（关键：先解析 URL，再发）
-      let directUrl = ''
+    if (input === cfg.nextPageCommand || input === cfg.prevPageCommand) {
+      const newPage = input === cfg.nextPageCommand ? st.page + 1 : Math.max(1, st.page - 1)
       try {
-        directUrl = await resolveDirectUrl(selected.id)
-      } catch (e) {
-        logger.warn(`resolve direct url failed: ${String(e)}`)
-        if (config.recallMessages.includes('getSongFailed') === false) {
-          await session.send(config.getSongFailed)
-        }
-        // tip 可撤回，歌单不要强制撤回，方便你再选一次
-        if (config.recallMessages.includes('generationTip') && tipMessageId) recallLater(session, tipMessageId)
-        pendingMap.delete(rateKey)
-        return
-      }
+        const data = await httpGetJson(ctx, cfg, buildSearchUrl(cfg, st.keyword, newPage))
+        const songs: SongItem[] = Array.isArray(data) ? data : (data?.data ?? [])
+        if (!songs?.length) return '没有更多结果了。'
 
-      // 时长限制：如果拿不到 duration（=0），跳过限制
-      const interval = selected.duration > 0 ? selected.duration / 1000 : 0
-      if (interval > 0 && interval > Number(config.maxDurationMin || 30) * 60) {
-        if (config.recallMessages.includes('durationExceeded') === false) {
-          await session.send(config.durationExceeded)
-        }
-        if (config.recallMessages.includes('generationTip') && tipMessageId) recallLater(session, tipMessageId)
-        // 歌单是否撤回看你配置
-        if (config.recallMessages.includes('songList') && state.songListMessageId) recallLater(session, state.songListMessageId)
-        pendingMap.delete(rateKey)
-        return
+        const menu = renderMenu(cfg, st.keyword, newPage, songs)
+        const menuMessageIds = await safeSend(session, menu)
+        pending.set(k, { ...st, page: newPage, songs, createdAt: Date.now(), menuMessageIds })
+      } catch (e: any) {
+        debug('page failed: %s', e?.message || e)
+        return '翻页失败（API 不可用或超时），请稍后再试。'
       }
+      return
+    }
 
-      // 发送
-      try {
-        const title = `${selected.name} - ${selected.artists}`
-        if (config.srcToWhat === 'text') {
-          await session.send(directUrl)
-        } else if (config.srcToWhat === 'audiobuffer') {
-          const file = await ctx.http.file(directUrl)
-          await session.send(h.audio(file.data, file.type))
-        } else if (config.srcToWhat === 'file') {
-          await session.send(h.file(directUrl, { title }))
-        } else if (config.srcToWhat === 'video') {
-          await session.send(h.video(directUrl, { title }))
-        } else {
-          // 默认 audio（直链）
-          await session.send(h.audio(directUrl))
-        }
-
-        // 成功后按配置撤回提示/歌单（延迟）
-        if (config.recallMessages.includes('generationTip') && tipMessageId) recallLater(session, tipMessageId)
-        if (config.recallMessages.includes('songList') && state.songListMessageId) recallLater(session, state.songListMessageId)
-      } catch (e) {
-        logger.warn(`send failed: ${String(e)}`)
-        if (config.recallMessages.includes('getSongFailed') === false) {
-          await session.send(config.getSongFailed)
-        }
-        // 失败：只撤回 tip，不强制撤回歌单，方便你重试
-        if (config.recallMessages.includes('generationTip') && tipMessageId) recallLater(session, tipMessageId)
-      } finally {
-        pendingMap.delete(rateKey)
+    if (isExitInput(input, cfg.exitCommandList)) {
+      pending.delete(k)
+      if (cfg.menuRecallSec > 0 && cfg.recallMessages.includes('songList') && !cfg.recallOnlyAfterSuccess) {
+        await safeRecall(session, st.menuMessageIds)
       }
-    })
+      return '已退出歌曲选择。'
+    }
+
+    const idx = Number(input)
+    if (!Number.isInteger(idx) || idx < 1 || idx > st.songs.length) return next()
+
+    const song = st.songs[idx - 1]
+    const tipIds = await safeSend(session, cfg.generationTip)
+
+    let sentOk = false
+    try {
+      const urlData = await httpGetJson(ctx, cfg, buildSongUrl(cfg, song))
+      const directUrl: string | undefined = urlData?.url
+      if (!directUrl) throw new Error('no url from api')
+
+      const useBuffer = (cfg.sendMode === 'buffer') || cfg.forceTranscode
+
+      if (!useBuffer) {
+        await session.send(h.audio(directUrl))
+        sentOk = true
+      } else {
+        const raw = await httpGetBuffer(ctx, cfg, directUrl)
+        const wav = await ffmpegToWav(cfg, raw)
+
+        if (!ctx.silk?.encode) throw new Error('silk service not available')
+        const silkBuf = await Promise.resolve(ctx.silk.encode(wav))
+        await session.send(h.audio(silkBuf, 'audio/silk'))
+        sentOk = true
+      }
+    } catch (e: any) {
+      debug('send failed: %s', e?.message || e)
+      sentOk = false
+      await session.send('获取/发送失败：高码率可能返回 wma，建议降低音质，或开启强制转码并使用 buffer。')
+    } finally {
+      if (!cfg.recallOnlyAfterSuccess || sentOk) {
+        if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
+          ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
+        }
+        if (cfg.recallMessages.includes('songList') && cfg.menuRecallSec > 0) {
+          if (!(cfg.keepMenuIfSendFailed && !sentOk)) {
+            ctx.setTimeout(() => safeRecall(session, st.menuMessageIds), cfg.menuRecallSec * 1000)
+          }
+        }
+      }
+    }
+
+    if (sentOk) pending.delete(k)
+    else pending.set(k, { ...st, createdAt: Date.now() })
+
+    return
+  })
 }
