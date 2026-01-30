@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-music-to-voice",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "音乐聚合点播语音插件：搜索歌曲、翻页选择、序号点播，可选转码发送语音。数据来源：GD音乐台 API。",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -38,10 +38,12 @@
     "koishi": "^4.18.0"
   },
   "dependencies": {
-    "axios": "^1.7.7"
+    "axios": "^1.13.4"
   },
   "devDependencies": {
-    "koishi": "^4.18.0",
+    "@types/node": "^25.1.0",
+    "koishi": "^4.18.10",
+    "koishi-plugin-puppeteer": "^3.9.0",
     "tsup": "^8.2.4",
     "typescript": "^5.4.5"
   },
