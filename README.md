@@ -1,2 +1,12 @@
-# koishi-plugin-music-voice-pro
-koishi音乐插件
+# 🎵 Koishi 点歌语音插件 (music-voice-pro)
+
+一个适用于 Koishi 机器人的点歌语音插件，支持：
+
+- 🔍 搜索歌曲并返回列表
+- 📄 下一页 / 上一页翻页选择
+- 🔢 输入序号点歌
+- 🎤 发送语音（可选 ffmpeg + silk 转码）
+- 🗑 自动撤回菜单 / 提示 / 语音（可配置）
+- 🎛 后台可选择音源
+
+
