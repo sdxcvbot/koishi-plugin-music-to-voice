@@ -1,12 +1,39 @@
 {
-  "name": "koishi-plugin-music-voice-pro",
-  "version": "0.1.0",
-  "description": "点歌插件，支持搜索、翻页、silk语音发送。使用 GD音乐台 API。",
-  "main": "lib/index.cjs",
-  "module": "lib/index.mjs",
-  "types": "lib/index.d.ts",
-  "files": ["lib"],
+  "name": "koishi-plugin-music-to-voice",
+  "version": "1.0.0",
+  "description": "音乐聚合点播语音插件：搜索歌曲、翻页选择、序号点播，可选转码发送语音。数据来源：GD音乐台 API。",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "koishi",
+    "koishi-plugin",
+    "music",
+    "voice",
+    "aggregate"
+  ],
   "license": "MIT",
+  "author": "sdxcvbot <zhufuzhi1@gmail.com>",
+  "homepage": "https://github.com/sdxcvbot/koishi-plugin-music-to-voice#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sdxcvbot/koishi-plugin-music-to-voice.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sdxcvbot/koishi-plugin-music-to-voice/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  },
   "peerDependencies": {
     "koishi": "^4.18.0"
   },
@@ -20,14 +47,20 @@
   },
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts",
-    "dev": "tsup src/index.ts --watch --format cjs,esm --dts"
+    "dev": "tsup src/index.ts --watch --format cjs,esm --dts",
+    "prepublishOnly": "npm run build"
   },
-  "keywords": [
-    "koishi",
-    "music",
-    "voice",
-    "qq",
-    "silk",
-    "gd音乐台"
-  ]
+  "koishi": {
+    "description": {
+      "zh": "音乐聚合点播语音插件：搜索→列表→翻页→序号点播；可选 ffmpeg+silk 转码发送语音。数据来源：GD音乐台 API。"
+    },
+    "service": {
+      "optional": [
+        "puppeteer",
+        "downloads",
+        "ffmpeg",
+        "silk"
+      ]
+    }
+  }
 }
