@@ -131,14 +131,24 @@ async function httpGetBuffer(ctx: Context, url: string, cfg: Config): Promise<Bu
 
   for (let i = 0; i <= retry; i++) {
     try {
-      const arr = await ctx.http.get<ArrayBuffer>(url, {
+      if (cfg.debug) logger.info(`downloading url: ${url} (attempt ${i + 1}/${retry + 1})`)
+      const res = await ctx.http.get<any>(url, {
         timeout: cfg.requestTimeoutMs,
         headers,
         responseType: 'arraybuffer',
       })
-      return Buffer.from(arr)
+      // 兼容适配器：有的直接返回 ArrayBuffer，有的返回 { data, headers }
+      const arr = (res?.data ?? res) as ArrayBuffer
+      const buf = Buffer.from(arr)
+
+      // 尝试读取 headers
+      const contentType = (res?.headers && (res.headers['content-type'] || res.headers['Content-Type'])) || ''
+      const contentLengthHeader = (res?.headers && (res.headers['content-length'] || res.headers['Content-Length'])) || ''
+      if (cfg.debug) logger.info(`downloaded ${buf.length} bytes from ${url} content-type=${contentType} content-length=${contentLengthHeader}`)
+      return buf
     } catch (e: any) {
       lastErr = e
+      logger.warn(`download attempt ${i + 1} failed for ${url}: ${e?.message || e}`)
       if (i < retry) await sleep(250 + i * 250)
     }
   }
@@ -187,8 +197,13 @@ async function ffmpegToWavBuffer(input: Buffer, cfg: Config): Promise<Buffer> {
         if (!out.length) return reject(new Error('ffmpeg output empty'))
         resolve(out)
       } else {
-        const msg = Buffer.concat(errChunks).toString('utf8') || `ffmpeg exit ${code}`
-        reject(new Error(msg))
+        const stderr = Buffer.concat(errChunks).toString('utf8')
+        const msg = stderr || `ffmpeg exit ${code}`
+        logger.warn(`ffmpegToWavBuffer failed: ${msg}`)
+        const err = new Error(msg)
+        // attach stderr for callers
+        ;(err as any).stderr = stderr
+        reject(err)
       }
     })
 
@@ -227,8 +242,12 @@ async function ffmpegTranscode(input: Buffer, cfg: Config, format: TranscodeForm
           if (!out.length) return reject(new Error('ffmpeg output empty'))
           resolve({ buffer: out, mime: 'audio/aac' })
         } else {
-          const msg = Buffer.concat(errChunks).toString('utf8') || `ffmpeg exit ${code}`
-          reject(new Error(msg))
+            const stderr = Buffer.concat(errChunks).toString('utf8')
+            const msg = stderr || `ffmpeg exit ${code}`
+            logger.warn(`ffmpegTranscode(aac) failed: ${msg}`)
+            const err = new Error(msg)
+            ;(err as any).stderr = stderr
+            reject(err)
         }
       })
       p.stdin.end(input)
@@ -325,6 +344,8 @@ export interface Config {
   prevPageCmd: string
   exitCmds: string[]
   showExitHint: boolean
+  // 是否允许群内其他人选择点歌（默认 false，仅原请求人可选择）
+  allowGroupSelect: boolean
   maxSongDurationMin: number
 
   // 请求
@@ -420,6 +441,7 @@ export const Config: Schema<Config> = Schema.intersect([
     prevPageCmd: Schema.string().default('上一页').description('翻页指令-上一页'),
     exitCmds: Schema.array(String).default(['0', '不听了']).description('退出选择指令（一行一个）'),
     showExitHint: Schema.boolean().default(true).description('是否在歌单末尾展示退出提示'),
+  allowGroupSelect: Schema.boolean().default(false).description('是否允许群内其他人选择点歌（false 则仅原请求人可选择）'),
     maxSongDurationMin: Schema.number().min(0).default(30).description('歌曲最长时长（分钟，0=不限制）'),
   }).description('歌单设置'),
 
@@ -471,7 +493,9 @@ interface PendingState {
   menuMessageIds: string[]
 }
 
-function pendingKey(session: Session) {
+function pendingKey(session: Session, cfg?: Config) {
+  // 如果允许群内其他人选择，则以平台+频道为 key（channel 级），否则默认每个用户一个 pending
+  if (cfg?.allowGroupSelect) return `${session.platform}:${session.channelId}`
   return `${session.platform}:${session.userId}:${session.channelId}`
 }
 
@@ -570,7 +594,7 @@ export function apply(ctx: Context, cfg: Config) {
   cmd.action(async ({ session }, keyword) => {
     if (!session) return
 
-    const k = pendingKey(session)
+  const k = pendingKey(session, cfg)
 
     // 处理“序号/上一页/下一页/退出”
     const st = pending.get(k)
@@ -669,7 +693,10 @@ export function apply(ctx: Context, cfg: Config) {
           if (r?.url) {
             finalUrl = r.url
             finalBr = br
+            if (cfg.debug) logger.info(`got url for id=${songId} br=${br} -> ${finalUrl}`)
             break
+          } else {
+            if (cfg.debug) logger.info(`no url returned for id=${songId} br=${br}`)
           }
         } catch (e: any) {
           lastErr = e
@@ -709,18 +736,23 @@ export function apply(ctx: Context, cfg: Config) {
       try {
         if (!needTranscode && cfg.sendMode === 'record') {
           // 直链：快，但 wma/风控时可能失败
+          if (cfg.debug) logger.info(`sending direct audio url to session: ${finalUrl}`)
           await session.send(h.audio(finalUrl))
           sentOk = true
         } else {
           // ✅ 稳定模式：下载 → ffmpeg 转码（根据配置）→ buffer 发送
+          if (cfg.debug) logger.info(`starting download for transcode: ${finalUrl}`)
           const raw = await httpGetBuffer(ctx, finalUrl, cfg)
+          if (cfg.debug) logger.info(`download complete, ${raw.length} bytes, starting transcode format=${cfg.transcodeFormat}`)
           try {
             const { buffer: outBuf, mime } = await ffmpegTranscode(raw, cfg, cfg.transcodeFormat, finalBr)
+            if (cfg.debug) logger.info(`transcode succeeded, mime=${mime}, bytes=${outBuf.length}`)
             await session.send(h.audio(outBuf, mime))
             sentOk = true
           } catch (e: any) {
             // 如果转码失败，尝试回退到 wav 以提高成功率
             logger.warn(`transcode failed: ${e?.message || e}; falling back to wav`)
+            if ((e as any)?.stderr) logger.warn(`ffmpeg stderr: ${(e as any).stderr}`)
             const wav = await ffmpegToWavBuffer(raw, cfg)
             await session.send(h.audio(wav, 'audio/wav'))
             sentOk = true
@@ -729,6 +761,7 @@ export function apply(ctx: Context, cfg: Config) {
       } catch (e: any) {
         const msg = e?.message || String(e)
         logger.warn(`send failed: ${msg}`)
+        if ((e as any)?.stderr) logger.warn(`ffmpeg stderr: ${(e as any).stderr}`)
         // ✅ 给用户更明确提示：高码率 wma 说明
         await session.send(
           `获取/发送失败：\n` +
