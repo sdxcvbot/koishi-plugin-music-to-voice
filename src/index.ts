@@ -490,7 +490,8 @@ interface PendingState {
   keyword: string
   items: SearchItem[]
   createdAt: number
-  menuMessageIds: string[]
+  // 适配不同 adapter 的返回（可能是 string / number / object），因此使用 any[]
+  menuMessageIds: any[]
 }
 
 function pendingKey(session: Session, cfg?: Config) {
@@ -559,9 +560,23 @@ function renderMenuText(cfg: Config, keyword: string, page: number, items: Searc
   return lines.join('\n')
 }
 
-async function safeRecall(session: Session, messageIds: string[]) {
+async function safeRecall(session: Session, messageIds: any[]) {
   for (const id of messageIds) {
-    try { await session.bot.deleteMessage(session.channelId!, id) } catch {}
+    try {
+      // 支持多种 id 形态：string/number/object
+      if (id === null || id === undefined) continue
+      // 常见 adapter 返回 message id 字符串/数字，直接传给 deleteMessage
+      // 有些适配器返回对象 { id, messageId, msgId }，尝试抽取字段
+      if (typeof id === 'object') {
+        const candidate = (id.messageId ?? id.msgId ?? id.id ?? id)
+        await session.bot.deleteMessage(session.channelId!, candidate as any)
+      } else {
+        await session.bot.deleteMessage(session.channelId!, id as any)
+      }
+    } catch (e) {
+      // 忽略失败，但记录下以便排查
+      logger.warn(`safeRecall failed to delete message id=${JSON.stringify(id)}: ${(e as any)?.message || e}`)
+    }
   }
 }
 
@@ -606,10 +621,10 @@ export function apply(ctx: Context, cfg: Config) {
     }
 
     // 生成中提示
-    const tipIds: string[] = []
+    const tipIds: any[] = []
     try {
       const id = await session.send(cfg.generationTip)
-      if (typeof id === 'string') tipIds.push(id)
+      if (id !== null && id !== undefined) tipIds.push(id)
     } catch {}
 
     // 先拿直链：支持降码率
@@ -750,7 +765,7 @@ export function apply(ctx: Context, cfg: Config) {
           st.menuMessageIds = []
           const txt = renderMenuText(cfg, st.keyword, st.page, items)
           const id = await session.send(txt)
-          if (typeof id === 'string') st.menuMessageIds.push(id)
+          if (id !== null && id !== undefined) st.menuMessageIds.push(id)
           pending.set(k, st)
         } catch (e: any) {
           logger.warn(`search failed: ${e?.message || e}`)
@@ -768,7 +783,7 @@ export function apply(ctx: Context, cfg: Config) {
           st.menuMessageIds = []
           const txt = renderMenuText(cfg, st.keyword, st.page, items)
           const id = await session.send(txt)
-          if (typeof id === 'string') st.menuMessageIds.push(id)
+          if (id !== null && id !== undefined) st.menuMessageIds.push(id)
           pending.set(k, st)
         } catch (e: any) {
           logger.warn(`search failed: ${e?.message || e}`)
@@ -816,9 +831,9 @@ export function apply(ctx: Context, cfg: Config) {
           const items = normalizeSearchItems(resp)
           st.items = items
           st.menuMessageIds = []
-          const text = renderMenuText(cfg, st.keyword, st.page, items)
-          const id = await session.send(text)
-          if (typeof id === 'string') st.menuMessageIds.push(id)
+      const text = renderMenuText(cfg, st.keyword, st.page, items)
+      const id = await session.send(text)
+      if (id !== null && id !== undefined) st.menuMessageIds.push(id)
           pending.set(k, st)
         } catch (e: any) {
           logger.warn(`search failed: ${e?.message || e}`)
@@ -834,9 +849,9 @@ export function apply(ctx: Context, cfg: Config) {
           const items = normalizeSearchItems(resp)
           st.items = items
           st.menuMessageIds = []
-          const text = renderMenuText(cfg, st.keyword, st.page, items)
-          const id = await session.send(text)
-          if (typeof id === 'string') st.menuMessageIds.push(id)
+      const text = renderMenuText(cfg, st.keyword, st.page, items)
+      const id = await session.send(text)
+      if (id !== null && id !== undefined) st.menuMessageIds.push(id)
           pending.set(k, st)
         } catch (e: any) {
           logger.warn(`search failed: ${e?.message || e}`)
@@ -1001,10 +1016,10 @@ export function apply(ctx: Context, cfg: Config) {
         return '没有搜索到结果。'
       }
 
-      const text = renderMenuText(cfg, kw, page, items)
-      const mid = await session.send(text)
-      const menuIds: string[] = []
-      if (typeof mid === 'string') menuIds.push(mid)
+  const text = renderMenuText(cfg, kw, page, items)
+  const mid = await session.send(text)
+  const menuIds: any[] = []
+  if (mid !== null && mid !== undefined) menuIds.push(mid)
 
       pending.set(k, {
         userId: session.userId!,
