@@ -1,237 +1,484 @@
-import { Context, Schema, h, Logger, Session } from 'koishi'
+import { Context, Schema, Logger, h, Session } from 'koishi'
 import { spawn } from 'node:child_process'
-
-declare module 'koishi' {
-  interface Context {
-    puppeteer?: any
-    downloads?: any
-    silk?: {
-      encode(input: Buffer, options?: any): Promise<Buffer> | Buffer
-    }
-  }
-}
 
 export const name = 'music-to-voice'
 
-// ✅ 必需：http
-// ✅ 可选：puppeteer / downloads / silk（以及你容器里装好的 ffmpeg 命令）
-export const inject = {
-  required: ['http'] as const,
-  optional: ['puppeteer', 'downloads', 'silk'] as const,
-}
-
 const logger = new Logger('music-to-voice')
 
-/** 音源枚举（参数值） */
-export type SourceValue =
-  | 'netease'
-  | 'tencent'
-  | 'tidal'
-  | 'spotify'
-  | 'ytmusic'
-  | 'qobuz'
-  | 'joox'
-  | 'deezer'
-  | 'migu'
-  | 'kugou'
-  | 'kuwo'
-  | 'ximalaya'
-  | 'apple'
+type SourceValue =
+  | 'netease' | 'tencent' | 'tidal' | 'spotify' | 'ytmusic' | 'qobuz'
+  | 'joox' | 'deezer' | 'migu' | 'kugou' | 'kuwo' | 'ximalaya' | 'apple'
 
-/** 音质 br */
-export type BrValue = 128 | 192 | 320 | 740 | 999
+type BrValue = 128 | 192 | 320 | 740 | 999
 
-export type SendMode = 'record' | 'buffer'
+type SendMode = 'record' | 'buffer'
+type TranscodeFormat = 'wav' | 'aac' | 'silk'
+
+interface SearchItem {
+  id?: string | number
+  songid?: string | number
+  name?: string
+  title?: string
+  artist?: string
+  author?: string
+  singer?: string
+  url?: string
+  pic?: string
+  duration?: number
+  time?: number
+}
+
+interface SearchResp {
+  code?: number
+  msg?: string
+  data?: any
+  result?: any
+}
+
+interface UrlResp {
+  code?: number
+  msg?: string
+  url?: string
+  br?: number
+  size?: number
+  type?: string
+}
+
+function toId(x: any): string | undefined {
+  if (x === null || x === undefined) return
+  const s = String(x).trim()
+  return s ? s : undefined
+}
+
+function pickName(it: any): string {
+  return (it?.name ?? it?.title ?? '未知歌曲').toString()
+}
+
+function pickArtist(it: any): string {
+  return (it?.artist ?? it?.author ?? it?.singer ?? '').toString()
+}
+
+function pickDurationSec(it: any): number | undefined {
+  const d = it?.duration ?? it?.time
+  if (d === null || d === undefined) return
+  const n = Number(d)
+  if (!Number.isFinite(n) || n <= 0) return
+  // 有些接口 duration 是毫秒
+  if (n > 10000) return Math.floor(n / 1000)
+  return Math.floor(n)
+}
+
+function fmtDuration(sec?: number): string | undefined {
+  if (!sec || sec <= 0) return
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return `${m}:${String(s).padStart(2, '0')}`
+}
+
+function safeJsonParse(x: any): any {
+  if (typeof x === 'object') return x
+  try { return JSON.parse(String(x)) } catch { return null }
+}
+
+function isLikelyWma(url?: string): boolean {
+  if (!url) return false
+  return /\.wma(\?|$)/i.test(url) || url.toLowerCase().includes('.wma')
+}
+
+async function sleep(ms: number) {
+  await new Promise<void>(r => setTimeout(r, ms))
+}
+
+async function httpGetJson(ctx: Context, url: string, cfg: Config) {
+  // 统一：带 UA、超时、重试
+  const headers: Record<string, string> = {
+    'user-agent': cfg.userAgent || 'koishi-music-to-voice/1.0',
+    'accept': 'application/json,text/plain,*/*',
+  }
+
+  const retry = Math.max(0, cfg.requestRetry)
+  let lastErr: any
+
+  for (let i = 0; i <= retry; i++) {
+    try {
+      const res = await ctx.http.get(url, {
+        timeout: cfg.requestTimeoutMs,
+        headers,
+        responseType: 'json',
+      })
+      // 某些 http 客户端返回的是完整响应对象（含 data），有些直接返回解析后的 body。
+      // 统一返回响应主体优先（如果存在 data 字段就返回 data）。
+      // 这样上层处理时可以更一致地处理各种库/适配器的差异。
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (res as any)?.data ?? res
+    } catch (e: any) {
+      lastErr = e
+      if (i < retry) await sleep(250 + i * 250)
+    }
+  }
+
+  throw lastErr
+}
+
+async function httpGetBuffer(ctx: Context, url: string, cfg: Config): Promise<Buffer> {
+  const headers: Record<string, string> = {
+    'user-agent': cfg.userAgent || 'koishi-music-to-voice/1.0',
+    'accept': '*/*',
+  }
+
+  const retry = Math.max(0, cfg.requestRetry)
+  let lastErr: any
+
+  for (let i = 0; i <= retry; i++) {
+    try {
+      const arr = await ctx.http.get<ArrayBuffer>(url, {
+        timeout: cfg.requestTimeoutMs,
+        headers,
+        responseType: 'arraybuffer',
+      })
+      return Buffer.from(arr)
+    } catch (e: any) {
+      lastErr = e
+      if (i < retry) await sleep(250 + i * 250)
+    }
+  }
+
+  throw lastErr
+}
+
+async function ffmpegToWavBuffer(input: Buffer, cfg: Config): Promise<Buffer> {
+  // 转成 NapCat 最稳的：24000Hz / mono / s16 wav
+  // 用 pipe 避免写文件
+  const args = [
+    '-hide_banner',
+    '-loglevel', 'error',
+    '-i', 'pipe:0',
+    '-ac', '1',
+    '-ar', '24000',
+    '-f', 'wav',
+    'pipe:1',
+  ]
+
+  const bin = cfg.ffmpegBin || 'ffmpeg'
+
+  return await new Promise<Buffer>((resolve, reject) => {
+    const p = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+
+    const chunks: Buffer[] = []
+    const errChunks: Buffer[] = []
+
+    const killTimer = setTimeout(() => {
+      try { p.kill() } catch {}
+      reject(new Error('ffmpeg timeout'))
+    }, Math.max(3000, cfg.ffmpegTimeoutMs))
+
+    p.stdout.on('data', (d: Buffer) => chunks.push(d))
+    p.stderr.on('data', (d: Buffer) => errChunks.push(d))
+
+    p.on('error', (e) => {
+      clearTimeout(killTimer)
+      reject(e)
+    })
+
+    p.on('close', (code) => {
+      clearTimeout(killTimer)
+      if (code === 0) {
+        const out = Buffer.concat(chunks)
+        if (!out.length) return reject(new Error('ffmpeg output empty'))
+        resolve(out)
+      } else {
+        const msg = Buffer.concat(errChunks).toString('utf8') || `ffmpeg exit ${code}`
+        reject(new Error(msg))
+      }
+    })
+
+    p.stdin.end(input)
+  })
+}
+
+async function ffmpegTranscode(input: Buffer, cfg: Config, format: TranscodeFormat, br?: number): Promise<{ buffer: Buffer, mime: string }> {
+  const bin = cfg.ffmpegBin || 'ffmpeg'
+
+  if (format === 'aac') {
+    // 生成 ADTS AAC，NapCat/QQ 在 128k/192k AAC 下通常兼容
+    const bitrate = (br && br <= 192 && br >= 64) ? `${br}k` : '128k'
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', 'pipe:0',
+      '-vn',
+      '-c:a', 'aac',
+      '-b:a', bitrate,
+      '-f', 'adts',
+      'pipe:1',
+    ]
+
+    return await new Promise<{ buffer: Buffer, mime: string }>((resolve, reject) => {
+      const p = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+      const chunks: Buffer[] = []
+      const errChunks: Buffer[] = []
+      const killTimer = setTimeout(() => { try { p.kill() } catch {} ; reject(new Error('ffmpeg timeout')) }, Math.max(3000, cfg.ffmpegTimeoutMs))
+      p.stdout.on('data', (d: Buffer) => chunks.push(d))
+      p.stderr.on('data', (d: Buffer) => errChunks.push(d))
+      p.on('error', (e) => { clearTimeout(killTimer); reject(e) })
+      p.on('close', (code) => {
+        clearTimeout(killTimer)
+        if (code === 0) {
+          const out = Buffer.concat(chunks)
+          if (!out.length) return reject(new Error('ffmpeg output empty'))
+          resolve({ buffer: out, mime: 'audio/aac' })
+        } else {
+          const msg = Buffer.concat(errChunks).toString('utf8') || `ffmpeg exit ${code}`
+          reject(new Error(msg))
+        }
+      })
+      p.stdin.end(input)
+    })
+  }
+
+  if (format === 'wav') {
+    // delegate to existing wav pipeline
+    const buf = await ffmpegToWavBuffer(input, cfg)
+    return { buffer: buf, mime: 'audio/wav' }
+  }
+
+  // silk: 如果没有独立的 silk 编码器，回退到 wav（并在日志中提示）
+  logger.warn('transcodeFormat silk selected but silk encoding is not implemented; falling back to wav')
+  const buf = await ffmpegToWavBuffer(input, cfg)
+  return { buffer: buf, mime: 'audio/wav' }
+}
+
+async function checkFfmpegAvailable(bin: string, timeoutMs: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    try {
+      const p = spawn(bin, ['-version'], { stdio: ['ignore', 'pipe', 'pipe'] })
+      const errChunks: Buffer[] = []
+      const killTimer = setTimeout(() => {
+        try { p.kill() } catch {}
+        resolve(false)
+      }, Math.max(1000, timeoutMs))
+
+      p.stderr.on('data', (d: Buffer) => errChunks.push(d))
+      p.on('error', () => {
+        clearTimeout(killTimer)
+        resolve(false)
+      })
+      p.on('close', (code) => {
+        clearTimeout(killTimer)
+        // ffmpeg -version typically exits with 0; consider any exit as success
+        resolve(code === 0)
+      })
+    } catch {
+      resolve(false)
+    }
+  })
+}
+
+function sourceLabel(v: SourceValue) {
+  const map: Record<SourceValue, string> = {
+    netease: '网易云',
+    tencent: 'QQ音乐',
+    kuwo: '酷我',
+    kugou: '酷狗',
+    migu: '咪咕',
+    ximalaya: '喜马拉雅',
+    apple: 'Apple Music',
+    spotify: 'Spotify',
+    ytmusic: 'YouTube Music',
+    tidal: 'Tidal',
+    qobuz: 'Qobuz',
+    joox: 'JOOX',
+    deezer: 'Deezer',
+  }
+  return map[v] || v
+}
+
+function brLabel(v: BrValue) {
+  const map: Record<BrValue, string> = {
+    128: '128k（较稳）',
+    192: '192k（较稳）',
+    320: '320k（可能返回 wma）',
+    740: '740（无损，可能返回 wma）',
+    999: '999（无损，可能返回 wma）',
+  }
+  return map[v] || String(v)
+}
 
 export interface Config {
   // 基础
-  commandName: string
-  commandAlias: string
+  command: string
+  alias: string[]
+  apiBase: string
+
+  // 文案
   generationTip: string
   promptTimeoutSec: number
+  promptTimeout: string
+  exitPrompt: string
+  invalidNumber: string
+  durationExceeded: string
+  getSongFailed: string
 
-  // 歌单
-  searchListCount: number
-  nextPageCommand: string
-  prevPageCommand: string
-  exitCommandList: string[]
-  menuExitCommandTip: boolean
-  useImageMenu: boolean // puppeteer 开关（可选）
-
-  // 撤回
-  menuRecallSec: number
-  tipRecallSec: number
-  recallMessages: string[] // generationTip / songList
-  recallOnlyAfterSuccess: boolean
-  keepMenuIfSendFailed: boolean
+  // 搜索/歌单
+  searchCount: number
+  menuAsImage: boolean
+  nextPageCmd: string
+  prevPageCmd: string
+  exitCmds: string[]
+  showExitHint: boolean
+  maxSongDurationMin: number
 
   // 请求
-  apiBase: string
   source: SourceValue
   br: BrValue
-  userAgent: string
   requestTimeoutMs: number
+  requestRetry: number
+  userAgent: string
 
-  // 发送/转码
+  // 发送
   sendMode: SendMode
   forceTranscode: boolean
-  autoDowngradeBr: boolean
-  autoTranscodeWma: boolean
+  // 转码格式：
+  // - wav: 输出 24000Hz mono s16 wav（兼容 NapCat 的某些实现，但体积较大）
+  // - aac: 输出 ADTS AAC（体积小，NapCat/QQ 在 128k/192k AAC 下通常可直接播放）
+  // - silk: silk 格式（需要 silk 编码器支持，当前若选择会回退为 wav）
+  transcodeFormat: TranscodeFormat
   ffmpegBin: string
+  ffmpegTimeoutMs: number
 
-  // 限制
-  maxSongDurationMin: number
+  // 启动时检测 ffmpeg（可禁用）
+  checkFfmpegOnStart: boolean
+
+  // 撤回
+  recallMessages: ('generationTip' | 'songList')[]
+  tipRecallSec: number
+  menuRecallSec: number
+  recallOnlyAfterSuccess: boolean
+  keepMenuIfSendFailed: boolean
 
   // 调试
   debug: boolean
 }
 
-type SongItem = {
-  id: string
-  name: string
-  artist?: string[] | string
-  album?: string
-  source?: string
-  url_id?: string
-}
+const SourceSchema = Schema.union([
+  Schema.const('netease').description('网易云（netease）'),
+  Schema.const('tencent').description('QQ音乐（tencent）'),
+  Schema.const('kugou').description('酷狗（kugou）'),
+  Schema.const('kuwo').description('酷我（kuwo）'),
+  Schema.const('migu').description('咪咕（migu）'),
+  Schema.const('ximalaya').description('喜马拉雅（ximalaya）'),
+  Schema.const('apple').description('Apple Music（apple）'),
+  Schema.const('spotify').description('Spotify（spotify）'),
+  Schema.const('ytmusic').description('YouTube Music（ytmusic）'),
+  Schema.const('tidal').description('Tidal（tidal）'),
+  Schema.const('qobuz').description('Qobuz（qobuz）'),
+  Schema.const('joox').description('JOOX（joox）'),
+  Schema.const('deezer').description('Deezer（deezer）'),
+]) as unknown as Schema<SourceValue>
 
-type PendingState = {
-  userId: string
-  channelId: string
-  page: number
-  keyword: string
-  songs: SongItem[]
-  createdAt: number
-  menuMessageIds: string[]
-}
+const BrSchema = Schema.union([
+  Schema.const(128).description(brLabel(128)),
+  Schema.const(192).description(brLabel(192)),
+  Schema.const(320).description(brLabel(320)),
+  Schema.const(740).description(brLabel(740)),
+  Schema.const(999).description(brLabel(999)),
+]) as unknown as Schema<BrValue>
 
-const pending = new Map<string, PendingState>()
+const SendModeSchema = Schema.union([
+  Schema.const('record').description('语音 record（直链，快，但高码率 wma 可能失败）'),
+  Schema.const('buffer').description('语音 buffer（更稳，但更耗流量/时间）'),
+]) as unknown as Schema<SendMode>
 
-// ---------------- Schema（不使用 .options，避免你报的 TS 错误） ----------------
-
-const SourceSchema: Schema<SourceValue> = Schema.union([
-  Schema.const('netease').description('网易云（推荐）'),
-  Schema.const('tencent').description('QQ'),
-  Schema.const('kugou').description('酷狗'),
-  Schema.const('kuwo').description('酷我'),
-  Schema.const('migu').description('咪咕'),
-  Schema.const('ximalaya').description('喜马拉雅'),
-  Schema.const('apple').description('Apple Music'),
-  Schema.const('spotify').description('Spotify'),
-  Schema.const('ytmusic').description('YouTube Music'),
-  Schema.const('deezer').description('Deezer'),
-  Schema.const('tidal').description('Tidal'),
-  Schema.const('qobuz').description('Qobuz'),
-  Schema.const('joox').description('JOOX'),
-]).default('netease')
-
-const BrSchema: Schema<BrValue> = Schema.union([
-  Schema.const(128).description('128k（更稳，常返回 aac）'),
-  Schema.const(192).description('192k（更稳，常返回 aac）'),
-  Schema.const(320).description('320k（可能返回 wma，建议转码/降级）'),
-  Schema.const(740).description('740（无损，常返回 wma，建议转码）'),
-  Schema.const(999).description('999（无损，常返回 wma，建议转码）'),
-]).default(999)
-
-const SendModeSchema: Schema<SendMode> = Schema.union([
-  Schema.const('record').description('语音（直链）'),
-  Schema.const('buffer').description('语音（buffer，更稳）'),
-]).default('record')
-
-// 尝试让 UI 变 checkbox；不支持也不会 TS 报错
-const RecallMessagesSchema: Schema<string[]> = (() => {
-  const base: any = Schema.array(String).default(['generationTip', 'songList'])
-  return base?.role ? base.role('checkbox') : base
-})()
+const RecallKeySchema = Schema.union([
+  Schema.const('generationTip').description('“生成中”提示消息'),
+  Schema.const('songList').description('歌单消息'),
+])
 
 export const Config: Schema<Config> = Schema.intersect([
-  // ✅ 只在设置页提示，不打后台日志
   Schema.object({
-    _tip1: Schema.const('tip').description('开启插件前，请确保以下服务已经启用（可选安装）：puppeteer / downloads / silk；并确保容器内存在 ffmpeg。'),
-    _tip2: Schema.const('tip2').description('建议：若你使用 Napcat QQ，320k 以上经常返回 wma，直链容易失败；建议开启【强制转码】并使用 buffer 发送。'),
-  }),
+    command: Schema.string().default('music').description('使用的指令名称'),
+    alias: Schema.array(String).default(['听歌']).description('使用的指令别名（可多个）'),
 
-  Schema.object({
-    commandName: Schema.string().default('music').description('使用的指令名称'),
-    commandAlias: Schema.string().default('听歌').description('使用的指令别名'),
-    generationTip: Schema.string().default('生成语音中…').description('生成语音时返回的文字提示'),
-    promptTimeoutSec: Schema.number().default(45).min(5).max(300).description('等待用户选择歌曲序号的最长时间（秒）'),
+    apiBase: Schema.string().default('https://music-api.gdstudio.xyz/api.php')
+      .description('GD 音乐台 API 地址（如：https://music-api.gdstudio.xyz/api.php）'),
   }).description('基础设置'),
 
   Schema.object({
-    searchListCount: Schema.number().default(20).min(5).max(50).description('搜索返回条数'),
-    nextPageCommand: Schema.string().default('下一页').description('翻页指令-下一页'),
-    prevPageCommand: Schema.string().default('上一页').description('翻页指令-上一页'),
-    exitCommandList: Schema.array(String).default(['0', '不听了']).description('退出选择指令（一行一个）'),
-    menuExitCommandTip: Schema.boolean().default(true).description('是否在歌单末尾显示退出提示'),
-    useImageMenu: Schema.boolean().default(false).description('开启后返回图片歌单（需要 puppeteer 服务）'),
+    generationTip: Schema.string().default('生成语音中…').description('生成语音时返回的提示文字'),
+    promptTimeoutSec: Schema.number().default(45).description('等待用户输入序号的最长时间（秒）'),
+    promptTimeout: Schema.string().default('输入超时，已取消点歌。').description('超时提示'),
+    exitPrompt: Schema.string().default('已退出歌曲选择。').description('退出提示'),
+    invalidNumber: Schema.string().default('序号输入错误，已退出歌曲选择。').description('序号错误提示'),
+    durationExceeded: Schema.string().default('歌曲时长超出限制，已取消发送。').description('时长超限提示'),
+    getSongFailed: Schema.string().default('获取歌曲失败，请稍后再试。').description('获取失败提示'),
+  }).description('文案设置'),
+
+  Schema.object({
+    searchCount: Schema.number().min(1).max(50).default(20).description('搜索的歌曲列表数量'),
+    menuAsImage: Schema.boolean().default(false)
+      .description('开启后返回图片歌单（需要 puppeteer 服务；未安装则自动回退文本）'),
+    nextPageCmd: Schema.string().default('下一页').description('翻页指令-下一页'),
+    prevPageCmd: Schema.string().default('上一页').description('翻页指令-上一页'),
+    exitCmds: Schema.array(String).default(['0', '不听了']).description('退出选择指令（一行一个）'),
+    showExitHint: Schema.boolean().default(true).description('是否在歌单末尾展示退出提示'),
+    maxSongDurationMin: Schema.number().min(0).default(30).description('歌曲最长时长（分钟，0=不限制）'),
   }).description('歌单设置'),
 
   Schema.object({
-    menuRecallSec: Schema.number().default(60).min(0).max(600).description('歌单撤回秒数（0=不撤回）'),
-    tipRecallSec: Schema.number().default(10).min(0).max(120).description('“生成中”提示撤回秒数（0=不撤回）'),
-    recallMessages: (RecallMessagesSchema as any).description('勾选后撤回对应消息（generationTip/songList）'),
-    recallOnlyAfterSuccess: Schema.boolean().default(true).description('仅在发送成功后才撤回（推荐开启）'),
-    keepMenuIfSendFailed: Schema.boolean().default(true).description('发送失败时保留歌单（推荐开启）'),
-  }).description('撤回策略'),
-
-  Schema.object({
-    apiBase: Schema.string().default('https://music-api.gdstudio.xyz/api.php').description('后端 API 地址（GD 音乐台）'),
-    source: (SourceSchema as any).description('source：音乐源（部分可能失效，建议使用稳定音乐源）'),
-    br: (BrSchema as any).description('br：音质（740/999 为无损；高码率常返回 wma，建议转码）'),
-    userAgent: Schema.string().default('koishi-music-to-voice/1.0').description('请求 UA'),
-    requestTimeoutMs: Schema.number().default(15000).min(3000).max(60000).description('请求超时（毫秒）'),
+    source: SourceSchema.default('netease')
+      .description('音乐源（部分可能失效，建议使用稳定音乐源）'),
+    br: BrSchema.default(999)
+      .description('音质 br（740/999 无损；高码率可能返回 wma，建议开启强制转码或改用 192/128）'),
+    userAgent: Schema.string().default('koishi-music-to-voice/1.0').description('请求 UA（部分站点会风控/403）'),
+    requestTimeoutMs: Schema.number().min(1000).default(15000).description('请求超时（毫秒）'),
+    requestRetry: Schema.number().min(0).max(5).default(1).description('请求失败重试次数'),
   }).description('请求设置'),
 
   Schema.object({
-    sendMode: (SendModeSchema as any).description('发送类型'),
-    forceTranscode: Schema.boolean().default(false).description('强制转码（开启后建议选择 buffer 发送：下载→ffmpeg→silk→buffer）'),
-    autoDowngradeBr: Schema.boolean().default(true).description('获取直链失败时自动降级码率重试（192→128）'),
-    autoTranscodeWma: Schema.boolean().default(true).description('检测到返回 wma 且直链发送时，自动改用转码/或降级'),
-    ffmpegBin: Schema.string().default('ffmpeg').description('ffmpeg 可执行文件名（容器一般为 ffmpeg）'),
-    maxSongDurationMin: Schema.number().default(30).min(0).max(180).description('歌曲最长持续时间（分钟，0=不限制）'),
+    sendMode: SendModeSchema.default('record').description('发送类型'),
+    forceTranscode: Schema.boolean().default(false)
+      .description('强制转码（下载→ffmpeg→wav→buffer；开启后建议选择 buffer 发送）'),
+    transcodeFormat: Schema.union(['wav', 'aac', 'silk'] as const).default('aac')
+      .description('转码目标格式（aac 推荐用于 QQ/NapCat）'),
+    ffmpegBin: Schema.string().default('ffmpeg').description('ffmpeg 可执行文件（容器一般为 ffmpeg 或 /usr/bin/ffmpeg）'),
+      ffmpegTimeoutMs: Schema.number().min(1000).default(20000).description('ffmpeg 转码超时（毫秒）'),
+      checkFfmpegOnStart: Schema.boolean().default(true).description('启动时检测 ffmpeg 是否可用（可禁用）'),
   }).description('进阶设置'),
+
+  Schema.object({
+    recallMessages: Schema.array(RecallKeySchema).role('checkbox')
+      .default(['generationTip', 'songList'])
+      .description('勾选后撤回对应消息（未勾选=不撤回）'),
+    tipRecallSec: Schema.number().min(0).default(10).description('“生成中”提示撤回秒数（0=不撤回）'),
+    menuRecallSec: Schema.number().min(0).default(60).description('歌单撤回秒数（0=不撤回）'),
+    recallOnlyAfterSuccess: Schema.boolean().default(true).description('仅在发送成功后才撤回（推荐开启）'),
+    keepMenuIfSendFailed: Schema.boolean().default(true).description('发送失败时保留歌单（推荐开启）'),
+  }).description('撤回设置'),
 
   Schema.object({
     debug: Schema.boolean().default(false).description('日志调试模式'),
   }).description('开发者选项'),
-]) as any
+])
 
-// ---------------- utils ----------------
+type PendingKey = string
 
-function keyOf(session: Session) {
-  const uid = session.userId ?? 'unknown-user'
-  const cid = session.channelId ?? 'unknown-channel'
-  return `${session.platform}:${uid}:${cid}`
+interface PendingState {
+  userId: string
+  channelId: string
+  page: number
+  keyword: string
+  items: SearchItem[]
+  createdAt: number
+  menuMessageIds: string[]
 }
 
-function normalizeArtists(artist: SongItem['artist']): string {
-  if (!artist) return ''
-  if (Array.isArray(artist)) return artist.join('/')
-  return String(artist)
+function pendingKey(session: Session) {
+  return `${session.platform}:${session.userId}:${session.channelId}`
 }
 
-function isExitInput(input: string, exits: string[]) {
-  const s = input.trim()
-  return exits.some(x => x.trim() === s)
-}
-
-async function safeSend(session: Session, content: any) {
-  const ret = await session.send(content)
-  if (Array.isArray(ret)) return ret.map(String)
-  if (ret == null) return []
-  return [String(ret)]
-}
-
-async function safeRecall(session: Session, messageIds: string[]) {
-  const bot: any = session.bot as any
-  if (!messageIds?.length) return
-  if (typeof bot?.deleteMessage !== 'function') return
-  for (const mid of messageIds) {
-    try {
-      await bot.deleteMessage(session.channelId, mid)
-    } catch {}
-  }
+function isExitInput(input: string, cfg: Config) {
+  const t = input.trim()
+  if (!t) return false
+  return cfg.exitCmds.map(x => x.trim()).filter(Boolean).includes(t)
 }
 
 function buildSearchUrl(cfg: Config, keyword: string, page: number) {
@@ -239,333 +486,258 @@ function buildSearchUrl(cfg: Config, keyword: string, page: number) {
   u.searchParams.set('types', 'search')
   u.searchParams.set('source', cfg.source)
   u.searchParams.set('name', keyword)
-  u.searchParams.set('count', String(cfg.searchListCount))
+  u.searchParams.set('count', String(cfg.searchCount))
   u.searchParams.set('pages', String(page))
   return u.toString()
 }
 
-function buildSongUrl(cfg: Config, song: SongItem, br: number) {
+function buildUrlUrl(cfg: Config, id: string, br: number) {
   const u = new URL(cfg.apiBase)
   u.searchParams.set('types', 'url')
-  u.searchParams.set('id', song.url_id || song.id)
+  u.searchParams.set('id', id)
   u.searchParams.set('source', cfg.source)
   u.searchParams.set('br', String(br))
   return u.toString()
 }
 
-async function httpGetJson(ctx: Context, cfg: Config, url: string) {
-  const res = await ctx.http.get(url, {
-    timeout: cfg.requestTimeoutMs,
-    headers: { 'user-agent': cfg.userAgent },
-  })
-  if (typeof res === 'string') return JSON.parse(res)
-  return res
+function normalizeSearchItems(resp: any): SearchItem[] {
+  // 兼容各种返回结构：resp.data / resp.result / resp
+  const r = resp?.data ?? resp?.result ?? resp
+  const arr =
+    r?.data ?? r?.result ?? r?.songs ?? r?.list ?? r
+
+  if (!arr) return []
+  if (Array.isArray(arr)) return arr
+  if (Array.isArray(arr?.list)) return arr.list
+  if (Array.isArray(arr?.songs)) return arr.songs
+  return []
 }
 
-async function httpGetBuffer(ctx: Context, cfg: Config, url: string): Promise<Buffer> {
-  const ab = await ctx.http.get<ArrayBuffer>(url, {
-    timeout: cfg.requestTimeoutMs,
-    responseType: 'arraybuffer',
-    headers: { 'user-agent': cfg.userAgent },
-  })
-  return Buffer.from(ab)
-}
-
-function isWmaUrl(url: string) {
-  const u = url.toLowerCase()
-  return u.includes('.wma') || u.includes('format=wma')
-}
-
-/**
- * ffmpeg：输入任意音频 buffer → 输出 wav(PCM, 24000Hz, mono)
- * （QQ 语音 silk 转码常用 24k mono）
- */
-async function ffmpegToWav(cfg: Config, input: Buffer): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-hide_banner',
-      '-loglevel', 'error',
-      '-i', 'pipe:0',
-      '-ac', '1',
-      '-ar', '24000',
-      '-f', 'wav',
-      'pipe:1',
-    ]
-    const p = spawn(cfg.ffmpegBin || 'ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] })
-    const chunks: Buffer[] = []
-    const err: Buffer[] = []
-    p.stdout.on('data', (d: Buffer) => chunks.push(d))
-    p.stderr.on('data', (d: Buffer) => err.push(d))
-    p.on('error', reject)
-    p.on('close', (code) => {
-      if (code === 0) return resolve(Buffer.concat(chunks))
-      reject(new Error(`ffmpeg failed: ${Buffer.concat(err).toString('utf8')}`))
-    })
-    p.stdin.end(input)
-  })
-}
-
-function renderMenuText(cfg: Config, keyword: string, page: number, songs: SongItem[]) {
+function renderMenuText(cfg: Config, keyword: string, page: number, items: SearchItem[]) {
   const lines: string[] = []
-  lines.push(`🎵 搜索：${keyword}（第 ${page} 页）`)
-  lines.push('')
-  for (let i = 0; i < songs.length; i++) {
-    const s = songs[i]
-    const artist = normalizeArtists(s.artist)
-    const title = artist ? `${s.name} - ${artist}` : s.name
-    // ✅ 不再输出 [--:--]
-    lines.push(`${i + 1}. ${title}`)
-  }
-  lines.push('')
-  lines.push(`指令：${cfg.prevPageCommand} / ${cfg.nextPageCommand}`)
-  if (cfg.menuExitCommandTip && cfg.exitCommandList?.length) {
-    lines.push(`退出：${cfg.exitCommandList.join(' / ')}`)
-  }
+  const header = `🎵 搜索：${keyword}（第 ${page} 页）`
+  lines.push(header, '')
+
+  items.slice(0, cfg.searchCount).forEach((it, i) => {
+    const idx = i + 1
+    const title = pickName(it)
+    const artist = pickArtist(it)
+    const dur = fmtDuration(pickDurationSec(it))
+    // ✅ 不再出现 [--:--]：拿不到就不显示
+    const suffix = dur ? `  [${dur}]` : ''
+    lines.push(`${idx}. ${title}${artist ? ` - ${artist}` : ''}${suffix}`)
+  })
+
+  lines.push('', `指令：${cfg.prevPageCmd} / ${cfg.nextPageCmd}`)
+  if (cfg.showExitHint) lines.push(`退出：${cfg.exitCmds.join(' / ')}`)
   lines.push('回复序号即可点歌。')
+
   return lines.join('\n')
 }
 
-async function renderMenuImage(ctx: Context, cfg: Config, keyword: string, page: number, songs: SongItem[]) {
-  if (!ctx.puppeteer) return null
-
-  const lines = songs.map((s, i) => {
-    const artist = normalizeArtists(s.artist)
-    const title = artist ? `${s.name} - ${artist}` : s.name
-    return `${i + 1}. ${title}`
-  })
-
-  const html = `
-  <html>
-    <head>
-      <meta charset="utf-8" />
-      <style>
-        body { font-family: Arial, "Microsoft YaHei"; padding: 24px; }
-        .title { font-size: 20px; font-weight: 700; margin-bottom: 12px; }
-        .item { font-size: 14px; line-height: 22px; }
-        .footer { margin-top: 12px; font-size: 12px; color: #666; }
-      </style>
-    </head>
-    <body>
-      <div class="title">🎵 搜索：${keyword}（第 ${page} 页）</div>
-      ${lines.map(x => `<div class="item">${x}</div>`).join('')}
-      <div class="footer">指令：${cfg.prevPageCommand} / ${cfg.nextPageCommand}　退出：${cfg.exitCommandList.join(' / ')}</div>
-    </body>
-  </html>
-  `
-
-  try {
-    const pageObj = await ctx.puppeteer.page()
-    await pageObj.setContent(html)
-    const buf: Buffer = await pageObj.screenshot({ type: 'png', fullPage: true })
-    await pageObj.close()
-    return buf
-  } catch {
-    return null
+async function safeRecall(session: Session, messageIds: string[]) {
+  for (const id of messageIds) {
+    try { await session.bot.deleteMessage(session.channelId!, id) } catch {}
   }
 }
-
-function uniqBrList(cfg: Config) {
-  const list: number[] = [cfg.br]
-  if (cfg.autoDowngradeBr) {
-    if (!list.includes(192)) list.push(192)
-    if (!list.includes(128)) list.push(128)
-  }
-  return list
-}
-
-async function getPlayableUrlWithFallback(ctx: Context, cfg: Config, song: SongItem): Promise<{ url: string; usedBr: number }> {
-  const brList = uniqBrList(cfg)
-
-  let lastErr: any = null
-
-  for (const br of brList) {
-    try {
-      const urlData = await httpGetJson(ctx, cfg, buildSongUrl(cfg, song, br))
-      const directUrl: string | undefined = urlData?.url
-      if (!directUrl) throw new Error('no url from api')
-
-      // 如果你选“直链”，但返回 wma：优先尝试降码率找 aac
-      if (cfg.sendMode === 'record' && cfg.autoTranscodeWma && isWmaUrl(directUrl)) {
-        // 继续循环试更低码率
-        lastErr = new Error(`wma at br=${br}`)
-        continue
-      }
-
-      return { url: directUrl, usedBr: br }
-    } catch (e) {
-      lastErr = e
-      continue
-    }
-  }
-
-  throw lastErr ?? new Error('failed to get url')
-}
-
-// ---------------- apply ----------------
 
 export function apply(ctx: Context, cfg: Config) {
-  const debug = (msg: string, ...args: any[]) => {
-    if (cfg.debug) logger.info(msg, ...args)
+  const pending = new Map<PendingKey, PendingState>()
+
+  // 启动时检测 ffmpeg（可配置禁用）
+  if (cfg.checkFfmpegOnStart) {
+    ;(async () => {
+      try {
+        const bin = cfg.ffmpegBin || 'ffmpeg'
+        const ok = await checkFfmpegAvailable(bin, cfg.ffmpegTimeoutMs)
+        if (ok) {
+          logger.info(`ffmpeg available: ${bin}`)
+        } else {
+          logger.warn(`ffmpeg not available: ${bin}. 转码相关功能可能无法使用。若本机已安装 ffmpeg，请确认路径或在配置中设置 ffmpegBin；要关闭此检查请设置 checkFfmpegOnStart=false`)
+          if (cfg.forceTranscode || cfg.transcodeFormat === 'aac') {
+            logger.warn('当前配置要求转码（forceTranscode 或 transcodeFormat=aac），但 ffmpeg 不可用，发送可能失败。')
+          }
+        }
+      } catch (e: any) {
+        logger.warn(`ffmpeg check failed: ${e?.message || e}`)
+      }
+    })()
   }
 
-  // 避免 “duplicate command names: music” 的坑：让用户可改 commandName
-  const cmd = ctx.command(cfg.commandName, '音乐聚合点歌并发送语音').alias(cfg.commandAlias)
+  const cmd = ctx.command(`${cfg.command} <keyword:text>`, '点歌并发送语音')
+  for (const a of (cfg.alias || [])) cmd.alias(a)
 
-  cmd.action(async (argv, ...args) => {
-    const session = argv.session as Session
-    const keyword = args.join(' ').trim()
-    if (!keyword) return `请输入关键词，例如：${cfg.commandAlias} 不甘`
+  cmd.action(async ({ session }, keyword) => {
+    if (!session) return
 
-    const k = keyOf(session)
-    const page = 1
+    const k = pendingKey(session)
 
-    let data: any
-    try {
-      data = await httpGetJson(ctx, cfg, buildSearchUrl(cfg, keyword, page))
-    } catch (e: any) {
-      debug('search failed: %s', e?.message || e)
-      return '搜索失败（API 不可用或超时），请稍后再试。'
-    }
-
-    const songs: SongItem[] = Array.isArray(data) ? data : (data?.data ?? [])
-    if (!songs?.length) return '未搜索到结果，请换个关键词。'
-
-    let menuMessageIds: string[] = []
-
-    if (cfg.useImageMenu) {
-      const img = await renderMenuImage(ctx, cfg, keyword, page, songs)
-      if (img) {
-        menuMessageIds = await safeSend(session, h.image(img, 'image/png'))
-      } else {
-        const menuText = renderMenuText(cfg, keyword, page, songs)
-        menuMessageIds = await safeSend(session, menuText)
-      }
-    } else {
-      const menuText = renderMenuText(cfg, keyword, page, songs)
-      menuMessageIds = await safeSend(session, menuText)
-    }
-
-    pending.set(k, {
-      userId: session.userId ?? 'unknown-user',
-      channelId: session.channelId ?? 'unknown-channel',
-      page,
-      keyword,
-      songs,
-      createdAt: Date.now(),
-      menuMessageIds,
-    })
-
-    // ✅ 默认：仅发送成功后才撤回，所以这里只在关闭 recallOnlyAfterSuccess 时才会定时撤回
-    if (cfg.menuRecallSec > 0 && cfg.recallMessages.includes('songList') && !cfg.recallOnlyAfterSuccess) {
-      ctx.setTimeout(async () => {
-        const st = pending.get(k)
-        if (!st || st.keyword !== keyword || st.page !== page) return
-        await safeRecall(session, st.menuMessageIds)
-      }, cfg.menuRecallSec * 1000)
-    }
-
-    return
-  })
-
-  ctx.middleware(async (session, next) => {
-    const k = keyOf(session)
+    // 处理“序号/上一页/下一页/退出”
     const st = pending.get(k)
-    if (!st) return next()
+    const input = String(keyword ?? '').trim()
 
-    // 超时
-    if (Date.now() - st.createdAt > cfg.promptTimeoutSec * 1000) {
-      pending.delete(k)
-      return next()
-    }
-
-    const input = String(session.content || '').trim()
-    if (!input) return next()
-
-    // 翻页
-    if (input === cfg.nextPageCommand || input === cfg.prevPageCommand) {
-      const newPage = input === cfg.nextPageCommand ? st.page + 1 : Math.max(1, st.page - 1)
-      try {
-        const data = await httpGetJson(ctx, cfg, buildSearchUrl(cfg, st.keyword, newPage))
-        const songs: SongItem[] = Array.isArray(data) ? data : (data?.data ?? [])
-        if (!songs?.length) return '没有更多结果了。'
-
-        let menuMessageIds: string[] = []
-        if (cfg.useImageMenu) {
-          const img = await renderMenuImage(ctx, cfg, st.keyword, newPage, songs)
-          if (img) menuMessageIds = await safeSend(session, h.image(img, 'image/png'))
-          else menuMessageIds = await safeSend(session, renderMenuText(cfg, st.keyword, newPage, songs))
-        } else {
-          menuMessageIds = await safeSend(session, renderMenuText(cfg, st.keyword, newPage, songs))
+    // 如果当前处在选择态，优先解释输入为控制指令
+    if (st && input) {
+      if (isExitInput(input, cfg)) {
+        pending.delete(k)
+        await session.send(cfg.exitPrompt)
+        return
+      }
+      if (input === cfg.nextPageCmd) {
+        st.page += 1
+        try {
+          const url = buildSearchUrl(cfg, st.keyword, st.page)
+          const resp = await httpGetJson(ctx, url, cfg)
+          const items = normalizeSearchItems(resp)
+          st.items = items
+          st.menuMessageIds = []
+          const text = renderMenuText(cfg, st.keyword, st.page, items)
+          const id = await session.send(text)
+          if (typeof id === 'string') st.menuMessageIds.push(id)
+          pending.set(k, st)
+        } catch (e: any) {
+          logger.warn(`search failed: ${e?.message || e}`)
+          await session.send(cfg.getSongFailed)
         }
-
-        pending.set(k, { ...st, page: newPage, songs, createdAt: Date.now(), menuMessageIds })
-      } catch (e: any) {
-        debug('page failed: %s', e?.message || e)
-        return '翻页失败（API 不可用或超时），请稍后再试。'
+        return
       }
-      return
-    }
-
-    // 退出
-    if (isExitInput(input, cfg.exitCommandList)) {
-      pending.delete(k)
-      if (cfg.menuRecallSec > 0 && cfg.recallMessages.includes('songList') && !cfg.recallOnlyAfterSuccess) {
-        await safeRecall(session, st.menuMessageIds)
+      if (input === cfg.prevPageCmd) {
+        st.page = Math.max(1, st.page - 1)
+        try {
+          const url = buildSearchUrl(cfg, st.keyword, st.page)
+          const resp = await httpGetJson(ctx, url, cfg)
+          const items = normalizeSearchItems(resp)
+          st.items = items
+          st.menuMessageIds = []
+          const text = renderMenuText(cfg, st.keyword, st.page, items)
+          const id = await session.send(text)
+          if (typeof id === 'string') st.menuMessageIds.push(id)
+          pending.set(k, st)
+        } catch (e: any) {
+          logger.warn(`search failed: ${e?.message || e}`)
+          await session.send(cfg.getSongFailed)
+        }
+        return
       }
-      return '已退出歌曲选择。'
-    }
 
-    // 选歌
-    const idx = Number(input)
-    if (!Number.isInteger(idx) || idx < 1 || idx > st.songs.length) return next()
+      // 输入序号
+      const n = Number(input)
+      if (!Number.isInteger(n) || n < 1 || n > st.items.length) {
+        pending.delete(k)
+        await session.send(cfg.invalidNumber)
+        return
+      }
 
-    const song = st.songs[idx - 1]
+      const chosen = st.items[n - 1]
+      const songId = toId(chosen?.id ?? chosen?.songid)
+      if (!songId) {
+        pending.delete(k)
+        await session.send(cfg.getSongFailed)
+        return
+      }
 
-    // 先发提示
-    const tipIds = await safeSend(session, cfg.generationTip)
+      // 生成中提示
+      const tipIds: string[] = []
+      try {
+        const id = await session.send(cfg.generationTip)
+        if (typeof id === 'string') tipIds.push(id)
+      } catch {}
 
-    let sentOk = false
+      // 先拿直链：支持降码率
+      const brFallback: number[] = cfg.br === 999
+        ? [999, 740, 320, 192, 128]
+        : cfg.br === 740
+          ? [740, 320, 192, 128]
+          : cfg.br === 320
+            ? [320, 192, 128]
+            : cfg.br === 192
+              ? [192, 128]
+              : [128]
 
-    try {
-      // 1) 先获取可播放 url（含降级）
-      const { url, usedBr } = await getPlayableUrlWithFallback(ctx, cfg, song)
+      let finalUrl: string | undefined
+      let finalBr: number | undefined
+      let lastErr: any
 
-      // 2) 判断是否用 buffer / 是否需要转码
+      for (const br of brFallback) {
+        try {
+          const api = buildUrlUrl(cfg, songId, br)
+          const resp = await httpGetJson(ctx, api, cfg)
+          // 兼容：有的适配器返回直接对象/字符串，有的把实际 payload 放在 data 字段
+          const parsed = safeJsonParse(resp)
+          // 优先使用 parsed，如果没有则尝试 resp.data，再回退到 resp
+          const r: UrlResp = parsed ?? (resp as any)?.data ?? resp
+          if (r?.url) {
+            finalUrl = r.url
+            finalBr = br
+            break
+          }
+        } catch (e: any) {
+          lastErr = e
+        }
+      }
+
+      if (!finalUrl) {
+        pending.delete(k)
+        if (cfg.debug) logger.warn(`no url from api, lastErr=${lastErr?.message || lastErr}`)
+        await session.send(cfg.getSongFailed)
+        // 撤回提示（可选）
+        if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
+          ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
+        }
+        return
+      }
+
+      // 时长限制（如果搜索项里能拿到 duration）
+      const durSec = pickDurationSec(chosen)
+      if (cfg.maxSongDurationMin > 0 && durSec && durSec > cfg.maxSongDurationMin * 60) {
+        pending.delete(k)
+        await session.send(cfg.durationExceeded)
+        if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
+          ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
+        }
+        return
+      }
+
       const needTranscode =
         cfg.forceTranscode ||
         cfg.sendMode === 'buffer' ||
-        (cfg.autoTranscodeWma && isWmaUrl(url))
+        isLikelyWma(finalUrl) ||
+        (finalBr !== undefined && finalBr >= 320) // 高码率更建议走 buffer
 
-      if (!needTranscode) {
-        // 直链
-        await session.send(h.audio(url))
-        sentOk = true
-      } else {
-        // buffer：下载→ffmpeg→silk→buffer
-        if (!ctx.silk?.encode) {
-          throw new Error('silk service not available (need koishi-plugin-silk)')
+      let sentOk = false
+
+      try {
+        if (!needTranscode && cfg.sendMode === 'record') {
+          // 直链：快，但 wma/风控时可能失败
+          await session.send(h.audio(finalUrl))
+          sentOk = true
+        } else {
+          // ✅ 稳定模式：下载 → ffmpeg 转码（根据配置）→ buffer 发送
+          const raw = await httpGetBuffer(ctx, finalUrl, cfg)
+          try {
+            const { buffer: outBuf, mime } = await ffmpegTranscode(raw, cfg, cfg.transcodeFormat, finalBr)
+            await session.send(h.audio(outBuf, mime))
+            sentOk = true
+          } catch (e: any) {
+            // 如果转码失败，尝试回退到 wav 以提高成功率
+            logger.warn(`transcode failed: ${e?.message || e}; falling back to wav`)
+            const wav = await ffmpegToWavBuffer(raw, cfg)
+            await session.send(h.audio(wav, 'audio/wav'))
+            sentOk = true
+          }
         }
-
-        const raw = await httpGetBuffer(ctx, cfg, url)
-        const wav = await ffmpegToWav(cfg, raw)
-        const silkBuf = await Promise.resolve(ctx.silk.encode(wav))
-
-        // QQ/Napcat 最稳：直接发 silk buffer
-        await session.send(h.audio(silkBuf as any, 'audio/silk'))
-        sentOk = true
+      } catch (e: any) {
+        const msg = e?.message || String(e)
+        logger.warn(`send failed: ${msg}`)
+        // ✅ 给用户更明确提示：高码率 wma 说明
+        await session.send(
+          `获取/发送失败：\n` +
+          `1) 320k 以上常返回 wma，建议将 br 改为 192/128；\n` +
+          `2) 或开启【强制转码】并选择 buffer 发送（downloads+ffmpeg+silk/NapCat 转码更稳）。`
+        )
       }
 
-      debug('sent ok: br=%s url=%s', usedBr, url)
-    } catch (e: any) {
-      debug('send failed: %s', e?.message || e)
-      sentOk = false
-      await session.send(
-        '获取/发送失败：\n' +
-          '1) 320k 以上常返回 wma，建议将 br 改为 192/128；\n' +
-          '2) 或开启【强制转码】并选择 buffer 发送（downloads+ffmpeg+silk）。'
-      )
-    } finally {
-      // ✅ 撤回：默认仅成功后撤回
+      // 撤回逻辑（按你要的：仅成功后撤回）
       if (!cfg.recallOnlyAfterSuccess || sentOk) {
         if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
           ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
@@ -576,12 +748,53 @@ export function apply(ctx: Context, cfg: Config) {
           }
         }
       }
+
+      pending.delete(k)
+      return
     }
 
-    // 成功就清理；失败保留歌单继续选（并刷新 timeout）
-    if (sentOk) pending.delete(k)
-    else pending.set(k, { ...st, createdAt: Date.now() })
+    // 新搜索
+    const kw = input
+    if (!kw) return '请输入关键词。'
 
-    return
+    const page = 1
+    try {
+      const url = buildSearchUrl(cfg, kw, page)
+      const resp = await httpGetJson(ctx, url, cfg)
+      const items = normalizeSearchItems(resp)
+
+      if (!items.length) {
+        return '没有搜索到结果。'
+      }
+
+      const text = renderMenuText(cfg, kw, page, items)
+      const mid = await session.send(text)
+      const menuIds: string[] = []
+      if (typeof mid === 'string') menuIds.push(mid)
+
+      pending.set(k, {
+        userId: session.userId!,
+        channelId: session.channelId!,
+        page,
+        keyword: kw,
+        items,
+        createdAt: Date.now(),
+        menuMessageIds: menuIds,
+      })
+
+      // 超时自动退出
+      ctx.setTimeout(() => {
+        const cur = pending.get(k)
+        if (!cur) return
+        if (Date.now() - cur.createdAt >= cfg.promptTimeoutSec * 1000) {
+          pending.delete(k)
+          session.send(cfg.promptTimeout).catch(() => {})
+        }
+      }, cfg.promptTimeoutSec * 1000)
+
+    } catch (e: any) {
+      logger.warn(`search failed: ${e?.message || e}`)
+      return cfg.getSongFailed
+    }
   })
 }
