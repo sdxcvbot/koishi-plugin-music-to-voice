@@ -131,7 +131,7 @@ async function httpGetBuffer(ctx: Context, url: string, cfg: Config): Promise<Bu
 
   for (let i = 0; i <= retry; i++) {
     try {
-      if (cfg.debug) logger.info(`downloading url: ${url} (attempt ${i + 1}/${retry + 1})`)
+  logger.info(`downloading url: ${url} (attempt ${i + 1}/${retry + 1})`)
       const res = await ctx.http.get<any>(url, {
         timeout: cfg.requestTimeoutMs,
         headers,
@@ -144,7 +144,7 @@ async function httpGetBuffer(ctx: Context, url: string, cfg: Config): Promise<Bu
       // 尝试读取 headers
       const contentType = (res?.headers && (res.headers['content-type'] || res.headers['Content-Type'])) || ''
       const contentLengthHeader = (res?.headers && (res.headers['content-length'] || res.headers['Content-Length'])) || ''
-      if (cfg.debug) logger.info(`downloaded ${buf.length} bytes from ${url} content-type=${contentType} content-length=${contentLengthHeader}`)
+  logger.info(`downloaded ${buf.length} bytes from ${url} content-type=${contentType} content-length=${contentLengthHeader}`)
       return buf
     } catch (e: any) {
       lastErr = e
@@ -693,10 +693,10 @@ export function apply(ctx: Context, cfg: Config) {
           if (r?.url) {
             finalUrl = r.url
             finalBr = br
-            if (cfg.debug) logger.info(`got url for id=${songId} br=${br} -> ${finalUrl}`)
+            logger.info(`got url for id=${songId} br=${br} -> ${finalUrl}`)
             break
           } else {
-            if (cfg.debug) logger.info(`no url returned for id=${songId} br=${br}`)
+            logger.info(`no url returned for id=${songId} br=${br}`)
           }
         } catch (e: any) {
           lastErr = e
@@ -705,7 +705,7 @@ export function apply(ctx: Context, cfg: Config) {
 
       if (!finalUrl) {
         pending.delete(k)
-        if (cfg.debug) logger.warn(`no url from api, lastErr=${lastErr?.message || lastErr}`)
+  logger.warn(`no url from api, lastErr=${lastErr?.message || lastErr}`)
         await session.send(cfg.getSongFailed)
         // 撤回提示（可选）
         if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
@@ -736,17 +736,17 @@ export function apply(ctx: Context, cfg: Config) {
       try {
         if (!needTranscode && cfg.sendMode === 'record') {
           // 直链：快，但 wma/风控时可能失败
-          if (cfg.debug) logger.info(`sending direct audio url to session: ${finalUrl}`)
+          logger.info(`sending direct audio url to session: ${finalUrl}`)
           await session.send(h.audio(finalUrl))
           sentOk = true
         } else {
           // ✅ 稳定模式：下载 → ffmpeg 转码（根据配置）→ buffer 发送
-          if (cfg.debug) logger.info(`starting download for transcode: ${finalUrl}`)
+          logger.info(`starting download for transcode: ${finalUrl}`)
           const raw = await httpGetBuffer(ctx, finalUrl, cfg)
-          if (cfg.debug) logger.info(`download complete, ${raw.length} bytes, starting transcode format=${cfg.transcodeFormat}`)
+          logger.info(`download complete, ${raw.length} bytes, starting transcode format=${cfg.transcodeFormat}`)
           try {
             const { buffer: outBuf, mime } = await ffmpegTranscode(raw, cfg, cfg.transcodeFormat, finalBr)
-            if (cfg.debug) logger.info(`transcode succeeded, mime=${mime}, bytes=${outBuf.length}`)
+            logger.info(`transcode succeeded, mime=${mime}, bytes=${outBuf.length}`)
             await session.send(h.audio(outBuf, mime))
             sentOk = true
           } catch (e: any) {
