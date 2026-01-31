@@ -588,6 +588,207 @@ export function apply(ctx: Context, cfg: Config) {
     })()
   }
 
+  // 处理选择的通用函数（抽取以便中间件与命令共用）
+  async function handleSelection(session: Session, st: PendingState, n: number, k: PendingKey) {
+    if (!session) return
+    if (!Number.isInteger(n) || n < 1 || n > st.items.length) {
+      pending.delete(k)
+      await session.send(cfg.invalidNumber)
+      return
+    }
+
+    const chosen = st.items[n - 1]
+    const songId = toId(chosen?.id ?? chosen?.songid)
+    if (!songId) {
+      pending.delete(k)
+      await session.send(cfg.getSongFailed)
+      return
+    }
+
+    // 生成中提示
+    const tipIds: string[] = []
+    try {
+      const id = await session.send(cfg.generationTip)
+      if (typeof id === 'string') tipIds.push(id)
+    } catch {}
+
+    // 先拿直链：支持降码率
+    const brFallback: number[] = cfg.br === 999
+      ? [999, 740, 320, 192, 128]
+      : cfg.br === 740
+        ? [740, 320, 192, 128]
+        : cfg.br === 320
+          ? [320, 192, 128]
+          : cfg.br === 192
+            ? [192, 128]
+            : [128]
+
+    let finalUrl: string | undefined
+    let finalBr: number | undefined
+    let lastErr: any
+
+    for (const br of brFallback) {
+      try {
+        const api = buildUrlUrl(cfg, songId, br)
+        const resp = await httpGetJson(ctx, api, cfg)
+        const parsed = safeJsonParse(resp)
+        const r: UrlResp = parsed ?? (resp as any)?.data ?? resp
+        if (r?.url) {
+          finalUrl = r.url
+          finalBr = br
+          logger.info(`got url for id=${songId} br=${br} -> ${finalUrl}`)
+          break
+        } else {
+          logger.info(`no url returned for id=${songId} br=${br}`)
+        }
+      } catch (e: any) {
+        lastErr = e
+      }
+    }
+
+    if (!finalUrl) {
+      pending.delete(k)
+      logger.warn(`no url from api, lastErr=${lastErr?.message || lastErr}`)
+      await session.send(cfg.getSongFailed)
+      if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
+        ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
+      }
+      return
+    }
+
+    const durSec = pickDurationSec(chosen)
+    if (cfg.maxSongDurationMin > 0 && durSec && durSec > cfg.maxSongDurationMin * 60) {
+      pending.delete(k)
+      await session.send(cfg.durationExceeded)
+      if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
+        ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
+      }
+      return
+    }
+
+    const needTranscode =
+      cfg.forceTranscode ||
+      cfg.sendMode === 'buffer' ||
+      isLikelyWma(finalUrl) ||
+      (finalBr !== undefined && finalBr >= 320)
+
+    let sentOk = false
+
+    try {
+      if (!needTranscode && cfg.sendMode === 'record') {
+        logger.info(`sending direct audio url to session: ${finalUrl}`)
+        await session.send(h.audio(finalUrl))
+        sentOk = true
+      } else {
+        logger.info(`starting download for transcode: ${finalUrl}`)
+        const raw = await httpGetBuffer(ctx, finalUrl, cfg)
+        logger.info(`download complete, ${raw.length} bytes, starting transcode format=${cfg.transcodeFormat}`)
+        try {
+          const { buffer: outBuf, mime } = await ffmpegTranscode(raw, cfg, cfg.transcodeFormat, finalBr)
+          logger.info(`transcode succeeded, mime=${mime}, bytes=${outBuf.length}`)
+          await session.send(h.audio(outBuf, mime))
+          sentOk = true
+        } catch (e: any) {
+          logger.warn(`transcode failed: ${e?.message || e}; falling back to wav`)
+          if ((e as any)?.stderr) logger.warn(`ffmpeg stderr: ${(e as any).stderr}`)
+          const wav = await ffmpegToWavBuffer(raw, cfg)
+          await session.send(h.audio(wav, 'audio/wav'))
+          sentOk = true
+        }
+      }
+    } catch (e: any) {
+      const msg = e?.message || String(e)
+      logger.warn(`send failed: ${msg}`)
+      if ((e as any)?.stderr) logger.warn(`ffmpeg stderr: ${(e as any).stderr}`)
+      await session.send(
+        `获取/发送失败：\n` +
+        `1) 320k 以上常返回 wma，建议将 br 改为 192/128；\n` +
+        `2) 或开启【强制转码】并选择 buffer 发送（downloads+ffmpeg+silk/NapCat 转码更稳）。`
+      )
+    }
+
+    if (!cfg.recallOnlyAfterSuccess || sentOk) {
+      if (cfg.recallMessages.includes('generationTip') && cfg.tipRecallSec > 0) {
+        ctx.setTimeout(() => safeRecall(session, tipIds), cfg.tipRecallSec * 1000)
+      }
+      if (cfg.recallMessages.includes('songList') && cfg.menuRecallSec > 0) {
+        if (!(cfg.keepMenuIfSendFailed && !sentOk)) {
+          ctx.setTimeout(() => safeRecall(session, st.menuMessageIds), cfg.menuRecallSec * 1000)
+        }
+      }
+    }
+
+    pending.delete(k)
+  }
+
+  // 中间件：拦截 pending 状态下的纯文本回复（例如群成员直接回复序号）
+  ctx.middleware(async (session, next) => {
+    try {
+      const text = String(session.content ?? '').trim()
+      if (!text) return next()
+      // 避免拦截新的点歌命令（例如“听歌 xxx”）
+      const first = text.split(/\s+/)[0]
+      if (first === cfg.command || (cfg.alias || []).includes(first)) return next()
+
+      const k = pendingKey(session, cfg)
+      const st = pending.get(k)
+      if (!st) return next()
+
+      // 若为控制指令
+      if (isExitInput(text, cfg)) {
+        pending.delete(k)
+        await session.send(cfg.exitPrompt)
+        return
+      }
+      if (text === cfg.nextPageCmd) {
+        st.page += 1
+        try {
+          const url = buildSearchUrl(cfg, st.keyword, st.page)
+          const resp = await httpGetJson(ctx, url, cfg)
+          const items = normalizeSearchItems(resp)
+          st.items = items
+          st.menuMessageIds = []
+          const txt = renderMenuText(cfg, st.keyword, st.page, items)
+          const id = await session.send(txt)
+          if (typeof id === 'string') st.menuMessageIds.push(id)
+          pending.set(k, st)
+        } catch (e: any) {
+          logger.warn(`search failed: ${e?.message || e}`)
+          await session.send(cfg.getSongFailed)
+        }
+        return
+      }
+      if (text === cfg.prevPageCmd) {
+        st.page = Math.max(1, st.page - 1)
+        try {
+          const url = buildSearchUrl(cfg, st.keyword, st.page)
+          const resp = await httpGetJson(ctx, url, cfg)
+          const items = normalizeSearchItems(resp)
+          st.items = items
+          st.menuMessageIds = []
+          const txt = renderMenuText(cfg, st.keyword, st.page, items)
+          const id = await session.send(txt)
+          if (typeof id === 'string') st.menuMessageIds.push(id)
+          pending.set(k, st)
+        } catch (e: any) {
+          logger.warn(`search failed: ${e?.message || e}`)
+          await session.send(cfg.getSongFailed)
+        }
+        return
+      }
+
+      // 数字选择
+      const n = Number(text)
+      if (Number.isInteger(n)) {
+        await handleSelection(session, st, n, k)
+        return
+      }
+    } catch (e: any) {
+      logger.warn(`pending middleware error: ${e?.message || e}`)
+    }
+    return next()
+  })
+
   const cmd = ctx.command(`${cfg.command} <keyword:text>`, '点歌并发送语音')
   for (const a of (cfg.alias || [])) cmd.alias(a)
 
